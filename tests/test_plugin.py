@@ -277,8 +277,9 @@ async def test_batch_processing():
         # Should never have more than 2 concurrent starts
         assert starts_before_end <= 2
 
-
-"""Integration tests for the stochastic plugin."""
+####
+# Integration tests for the stochastic plugin.
+####
 
 def test_marker_registered():
     """Test that the stochastic marker is registered."""
