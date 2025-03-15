@@ -240,46 +240,50 @@ async def test_retry_specific_exceptions():
 @pytest.mark.asyncio
 async def test_batch_processing():
     """Test that batch_size correctly limits concurrency."""
-    # Use a list to track when tests are running
-    execution_order = []
-
-    async def test_with_delay(index) -> bool:  # noqa: ANN001
-        execution_order.append(f"start_{index}")
-        await asyncio.sleep(0.1)  # Small delay
-        execution_order.append(f"end_{index}")
-        return True
-
-    # Run tests with different indices
-    tasks = []
-    # Create different test functions with different indices
-    for i in range(5):
-        # Create a proper async function that returns the awaitable directly
-        async def test_wrapper(idx=i):
-            return await test_with_delay(idx)
+    # Simplify the test to just check that the batching works correctly
+    # using a single test run with 5 samples and batch_size=2
+    
+    # Create an array of results to track when tests start and end
+    # Using a class to ensure we have proper synchronization
+    class TestTracker:
+        def __init__(self):
+            self.active_count = 0
+            self.max_active = 0
             
-        tasks.append(
-            _run_stochastic_tests(
-                testfunction=test_wrapper,  # Use the wrapper function
-                funcargs={},
-                stats=StochasticTestStats(),
-                samples=1,
-                batch_size=2,  # Run max 2 at a time
-                retry_on=None,
-                max_retries=1,
-                timeout=None,
-            ),
-        )
-
-    await asyncio.gather(*tasks)
-    # Check execution pattern - with batch_size=2, we should see at most 2 "start" before an "end"
-    starts_before_end = 0
-    for event in execution_order:
-        if event.startswith("start_"):
-            starts_before_end += 1
-        else:
-            starts_before_end -= 1
-        # Should never have more than 2 concurrent starts
-        assert starts_before_end <= 2
+        async def run_test(self):
+            # Track the number of active tests
+            self.active_count += 1
+            self.max_active = max(self.max_active, self.active_count)
+            
+            # Sleep to simulate work
+            await asyncio.sleep(0.1)
+            
+            # Decrement active count
+            self.active_count -= 1
+            return True
+    
+    tracker = TestTracker()
+    stats = StochasticTestStats()
+    
+    # Run a batch of tests with batch_size=2
+    await _run_stochastic_tests(
+        testfunction=tracker.run_test,
+        funcargs={},
+        stats=stats,
+        samples=5,  # Run 5 samples
+        batch_size=2,  # Max 2 concurrent
+        retry_on=None,
+        max_retries=1,
+        timeout=None,
+    )
+    
+    # Verify the statistics
+    assert stats.total_runs == 5
+    assert stats.successful_runs == 5
+    assert len(stats.failures) == 0
+    
+    # Check that we never had more than 2 tests running at once
+    assert tracker.max_active <= 2, f"Expected max 2 concurrent tests, got {tracker.max_active}"
 
 ####
 # Integration tests for the stochastic plugin.

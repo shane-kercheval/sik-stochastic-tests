@@ -49,22 +49,21 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
 
     # Check if test has asyncio marker - if so, let pytest-asyncio handle it
     # This avoids event loop conflicts with pytest-asyncio
-    
     # First check if the function itself has the asyncio marker
     has_asyncio_marker = False
     for marker in pyfuncitem.own_markers:
         if marker.name == 'asyncio':
             has_asyncio_marker = True
             break
-            
+    
     # Also check if it's in an asyncio class
-    if not has_asyncio_marker and hasattr(pyfuncitem, 'cls') and pyfuncitem.cls is not None:
-        if hasattr(pyfuncitem.cls, 'pytestmark'):
-            for marker in pyfuncitem.cls.pytestmark:
-                if marker.name == 'asyncio':
-                    has_asyncio_marker = True
-                    break
-                    
+    if (not has_asyncio_marker and hasattr(pyfuncitem, 'cls') and 
+            pyfuncitem.cls is not None and hasattr(pyfuncitem.cls, 'pytestmark')):
+        for marker in pyfuncitem.cls.pytestmark:
+            if marker.name == 'asyncio':
+                has_asyncio_marker = True
+                break
+    
     # If it has asyncio marker, let pytest-asyncio handle it
     if has_asyncio_marker:
         return None
