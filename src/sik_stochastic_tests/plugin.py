@@ -60,6 +60,12 @@ def has_asyncio_marker(obj: pytest.Function | object) -> bool:
                 if marker.name == 'asyncio':
                     return True
 
+    # If none of the above checks detected an asyncio marker but
+    # the function is a coroutine function, we'll need to treat it
+    # as an asyncio test to avoid errors
+    if hasattr(obj, 'obj') and inspect.iscoroutinefunction(obj.obj):  # noqa: SIM103
+        return True
+
     return False
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -81,7 +87,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     if pyfuncitem.config.getoption("--disable-stochastic", False):
         return None  # Run normally
 
-    # Check if test has asyncio marker - if so, let pytest-asyncio handle it
+    # Check if test has asyncio marker or is an async function - if so, let pytest-asyncio handle it  # noqa: E501
     # This avoids event loop conflicts with pytest-asyncio
     if has_asyncio_marker(pyfuncitem):
         return None
@@ -126,6 +132,8 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     finally:
         # Always clean up
         loop.close()
+        # Reset the event loop policy to default for pytest-asyncio compatibility
+        asyncio.set_event_loop(None)
 
     # Store the results for reporting
     _test_results[pyfuncitem.nodeid] = stats
@@ -205,8 +213,8 @@ async def _run_stochastic_tests(
         funcargs: dict[str, object],
         stats: StochasticTestStats,
         samples: int,
-        batch_size: int,
-        retry_on: tuple[Exception] | None,
+        batch_size: int | None,
+        retry_on: tuple[Exception] | list[type[Exception]] | None,
         max_retries: int = 3,
         timeout: int | None = None,  # noqa: ASYNC109
     ) -> list[bool]:
@@ -243,7 +251,7 @@ async def _run_stochastic_tests(
         if not coroutines:
             return []
 
-        if batch_size:
+        if batch_size and batch_size > 0:  # Ensure batch_size is positive
             results = []
             for i in range(0, len(coroutines), batch_size):
                 batch = coroutines[i:i + batch_size]
@@ -263,24 +271,12 @@ async def _run_stochastic_tests(
                     results.extend([False] * len(batch))
             return results
         else:  # noqa: RET505
-            try:
-                return await asyncio.gather(*coroutines, return_exceptions=True)
-            except Exception as e:
-                print(f"Unexpected error during test execution: {e}")
-                return [False] * len(coroutines)
+            # If no batch size or invalid batch size, run all at once with error handling
+            results = await asyncio.gather(*coroutines, return_exceptions=True)
+            return [r if not isinstance(r, Exception) else False for r in results]
 
-    results = await safe_gather(tasks, batch_size)
+    return await safe_gather(tasks, batch_size)
 
-    # Handle any exception objects in results
-    processed_results = []
-    for result in results:
-        if isinstance(result, Exception):
-            print(f"Exception during test execution: {result}")
-            processed_results.append(False)
-        else:
-            processed_results.append(result)
-
-    return processed_results
 
 @pytest.hookimpl(trylast=True)
 def pytest_terminal_summary(terminalreporter) -> None:  # noqa: ANN001

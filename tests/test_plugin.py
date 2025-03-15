@@ -740,3 +740,94 @@ class TestAsyncioClass:
         count = int(f.read())
 
     assert count == 1, f"Test in asyncio class should run 1 time (not {count}) with our fix that detects and avoids conflict"  # noqa: E501
+
+
+def test_async_no_asyncio_marker(example_test_dir: Path):
+    """Test that plugin correctly detects async functions and delegates them properly."""
+    # Create a counter file to track executions
+    counter_file = example_test_dir / "async_no_marker_counter.txt"
+    counter_file.write_text("0")
+
+    # Create a test file with an async function that has stochastic marker but no asyncio marker
+    # We need to add pytest.ini with asyncio_mode = auto to make it work without the marker
+    pytest_ini = example_test_dir / "pytest.ini"
+    pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+""")
+
+    # Create the test file
+    test_file = example_test_dir / "test_async_no_asyncio_marker.py"
+    test_file.write_text("""
+import pytest
+import asyncio
+
+# Test with stochastic but NO asyncio marker
+@pytest.mark.stochastic(samples=3, threshold=0.8)
+async def test_async_without_asyncio_marker():
+    # Read counter
+    with open("async_no_marker_counter.txt", "r") as f:
+        count = int(f.read())
+
+    # Increment counter
+    count += 1
+    with open("async_no_marker_counter.txt", "w") as f:
+        f.write(str(count))
+
+    # Simulate some async work
+    await asyncio.sleep(0.01)
+    assert True
+""")
+
+    # Run pytest on the file
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v"],
+        capture_output=True,
+        text=True,
+        cwd=example_test_dir,
+        check=False,
+    )
+
+    # Print output for debugging
+    print(f"STDOUT: {result.stdout}")
+    print(f"STDERR: {result.stderr}")
+
+    # Check if the test passed with either asyncio_mode=auto or our detection
+    assert "1 passed" in result.stdout or "SKIPPED" in result.stdout, f"Test failed unexpectedly: {result.stderr}"  # noqa: E501
+
+    # With our detection, the test should either run once or be skipped (not fail with IndexError)
+    with open(counter_file) as f:
+        count = int(f.read())
+
+    # The test might run once with asyncio_mode=auto, or it might be skipped entirely
+    # but what matters is that it doesn't crash with IndexError (which was the original issue)
+    assert count <= 1, f"Async test should run 0 or 1 time, but ran {count} times"
+
+def test_has_asyncio_marker_detects_coroutines():
+    """Test that has_asyncio_marker correctly identifies coroutine functions."""
+    from sik_stochastic_tests.plugin import has_asyncio_marker
+    import inspect
+
+    # Create a mock pytest.Function object with a coroutine function
+    async def async_func() -> None:
+        pass
+
+    def sync_func() -> None:
+        pass
+
+    # Create mock objects to test the function
+    mock_async = MagicMock()
+    mock_async.obj = async_func
+    mock_async.own_markers = []  # No markers
+
+    mock_sync = MagicMock()
+    mock_sync.obj = sync_func
+    mock_sync.own_markers = []  # No markers
+
+    # Test that our updated has_asyncio_marker detects coroutines
+    assert has_asyncio_marker(mock_async) is True, "Should detect coroutine function even without marker"  # noqa: E501
+    assert has_asyncio_marker(mock_sync) is False, "Should not detect non-coroutine function"
+
+    # Verify our detection is using inspect.iscoroutinefunction
+    assert inspect.iscoroutinefunction(async_func) is True
+    assert inspect.iscoroutinefunction(sync_func) is False

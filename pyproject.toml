@@ -1,6 +1,6 @@
 [project]
 name = "sik-stochastic-tests"
-version = "0.0.4"
+version = "0.0.5"
 description = "A pytest plugin for testing stochastic systems like LLMs, providing statistical confidence through multiple test runs."
 readme = "README.md"
 requires-python = ">=3.11"
