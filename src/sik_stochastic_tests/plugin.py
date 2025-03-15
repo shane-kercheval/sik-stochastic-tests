@@ -47,6 +47,28 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     if pyfuncitem.config.getoption("--disable-stochastic", False):
         return None  # Run normally
 
+    # Check if test has asyncio marker - if so, let pytest-asyncio handle it
+    # This avoids event loop conflicts with pytest-asyncio
+    
+    # First check if the function itself has the asyncio marker
+    has_asyncio_marker = False
+    for marker in pyfuncitem.own_markers:
+        if marker.name == 'asyncio':
+            has_asyncio_marker = True
+            break
+            
+    # Also check if it's in an asyncio class
+    if not has_asyncio_marker and hasattr(pyfuncitem, 'cls') and pyfuncitem.cls is not None:
+        if hasattr(pyfuncitem.cls, 'pytestmark'):
+            for marker in pyfuncitem.cls.pytestmark:
+                if marker.name == 'asyncio':
+                    has_asyncio_marker = True
+                    break
+                    
+    # If it has asyncio marker, let pytest-asyncio handle it
+    if has_asyncio_marker:
+        return None
+
     # Get stochastic parameters from marker
     samples = marker.kwargs.get('samples', 10)
     threshold = marker.kwargs.get('threshold', 0.5)
@@ -66,10 +88,12 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     actual_argnames = set(sig.parameters.keys())
     funcargs = {name: arg for name, arg in pyfuncitem.funcargs.items() if name in actual_argnames}
 
-    # Run the test stochastically
+    # Create a new event loop for the test
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    
     try:
+        # Run the stochastic tests
         loop.run_until_complete(
             _run_stochastic_tests(
                 testfunction=testfunction,
@@ -83,6 +107,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
             ),
         )
     finally:
+        # Always clean up
         loop.close()
 
     # Store the results for reporting
@@ -100,7 +125,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
 
     return True  # We handled this test
 
-async def _run_stochastic_tests(
+async def _run_stochastic_tests(  # noqa: PLR0915
         testfunction: callable,
         funcargs: dict[str, object],
         stats: StochasticTestStats,
@@ -115,29 +140,58 @@ async def _run_stochastic_tests(
         context = {"run_index": run_index}
         for attempt in range(max_retries):
             try:
+                # Special handling for pytest-asyncio's TestCase class methods
+                is_pytest_asyncio_method = False
+                if hasattr(testfunction, '__self__') and testfunction.__self__ is not None:
+                    if hasattr(testfunction.__self__.__class__, 'pytestmark'):
+                        for marker in testfunction.__self__.__class__.pytestmark:
+                            if marker.name == 'asyncio':
+                                is_pytest_asyncio_method = True
+                                break
+                
+                # Check if the function is a coroutine function
                 if inspect.iscoroutinefunction(testfunction):
                     # For async tests
                     if timeout is not None:
-                        async def run_test() -> None:
-                            return await testfunction(**funcargs)
                         try:
-                            await asyncio.wait_for(run_test(), timeout=timeout)
+                            # Simple timeout for async functions
+                            await asyncio.wait_for(
+                                testfunction(**funcargs), 
+                                timeout=timeout
+                            )
                         except asyncio.TimeoutError:  # noqa: UP041
                             raise TimeoutError(f"Test timed out after {timeout} seconds")
                     else:
-                        await testfunction(**funcargs)
+                        # For pytest-asyncio class methods, we need to be extra careful
+                        if is_pytest_asyncio_method:
+                            # Create a new task instead of directly awaiting
+                            task = asyncio.create_task(testfunction(**funcargs))
+                            await task
+                        else:
+                            await testfunction(**funcargs)
                 else:  # noqa: PLR5501
                     # For sync tests
                     if timeout is not None:
                         def run_sync() -> None:
                             return testfunction(**funcargs)
                         try:
-                            future = asyncio.get_event_loop().run_in_executor(None, run_sync)
+                            # Use an executor for sync functions
+                            loop = asyncio.get_running_loop()
+                            future = loop.run_in_executor(None, run_sync)
                             await asyncio.wait_for(future, timeout=timeout)
                         except asyncio.TimeoutError:  # noqa: UP041
                             raise TimeoutError(f"Test timed out after {timeout} seconds")
                     else:
-                        testfunction(**funcargs)
+                        # Check for special case - function might be using async def but not awaited
+                        if hasattr(testfunction, '__code__') and testfunction.__code__.co_flags & 0x80:
+                            # This is likely an async function that wasn't detected - try to await it
+                            result = testfunction(**funcargs)
+                            if inspect.isawaitable(result):
+                                await result  # Await the coroutine if it returns one
+                            # Otherwise it's already been handled
+                        else:
+                            # Direct call for normal sync functions
+                            testfunction(**funcargs)
 
                 stats.total_runs += 1
                 stats.successful_runs += 1
@@ -156,18 +210,52 @@ async def _run_stochastic_tests(
                 return False
         raise AssertionError(f"Test failed after {max_retries} attempts")
 
-    # Run tests in batches
+    # Run tests in batches with error handling
     tasks = [run_single_test(i) for i in range(samples)]
-    if batch_size:
-        results = []
-        for i in range(0, len(tasks), batch_size):
-            batch = tasks[i:i + batch_size]
-            batch_results = await asyncio.gather(*batch)
-            results.extend(batch_results)
-    else:
-        results = await asyncio.gather(*tasks)
 
-    return results
+    async def safe_gather(coroutines: list[asyncio.Task], batch_size: int | None) -> list[bool]:
+        """Safely gather coroutines with optional batching and error handling."""
+        if not coroutines:
+            return []
+
+        if batch_size:
+            results = []
+            for i in range(0, len(coroutines), batch_size):
+                batch = coroutines[i:i + batch_size]
+                try:
+                    batch_results = await asyncio.gather(*batch, return_exceptions=True)
+                    # Handle exceptions
+                    for result in batch_results:
+                        if isinstance(result, Exception):
+                            # Log the exception but treat as a failed test
+                            print(f"Exception during test execution: {result}")
+                            results.append(False)
+                        else:
+                            results.append(result)
+                except Exception as e:
+                    # This should rarely happen, but just in case
+                    print(f"Unexpected error during batch execution: {e}")
+                    results.extend([False] * len(batch))
+            return results
+        else:  # noqa: RET505
+            try:
+                return await asyncio.gather(*coroutines, return_exceptions=True)
+            except Exception as e:
+                print(f"Unexpected error during test execution: {e}")
+                return [False] * len(coroutines)
+
+    results = await safe_gather(tasks, batch_size)
+
+    # Handle any exception objects in results
+    processed_results = []
+    for result in results:
+        if isinstance(result, Exception):
+            print(f"Exception during test execution: {result}")
+            processed_results.append(False)
+        else:
+            processed_results.append(result)
+
+    return processed_results
 
 @pytest.hookimpl(trylast=True)
 def pytest_terminal_summary(terminalreporter) -> None:  # noqa: ANN001
