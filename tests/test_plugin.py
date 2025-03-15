@@ -521,3 +521,56 @@ def test_timeout():
     # Test should fail due to timeouts
     assert "1 failed" in result.stdout
     assert "timeout" in result.stdout.lower()
+
+
+# def test_asyncio_compatibility(example_test_dir: Path):
+#     """Test that stochastic works with pytest-asyncio."""
+#     # Create a counter file to track executions
+#     counter_file = example_test_dir / "asyncio_counter.txt"
+#     counter_file.write_text("0")
+
+#     # Create a test file that uses both asyncio and stochastic
+#     test_file = example_test_dir / "test_asyncio_stochastic.py"
+#     test_file.write_text("""
+# import pytest
+# import asyncio
+
+# @pytest.mark.asyncio
+# class TestAsyncioStochastic:
+#     @pytest.mark.stochastic(samples=3)
+#     async def test_with_both_decorators(self):
+#         # Read counter
+#         with open("asyncio_counter.txt", "r") as f:
+#             count = int(f.read())
+        
+#         # Increment counter
+#         count += 1
+#         with open("asyncio_counter.txt", "w") as f:
+#             f.write(str(count))
+        
+#         # Simulate some async work
+#         await asyncio.sleep(0.01)
+#         assert True
+# """)
+
+#     # Run pytest on the file
+#     result = subprocess.run(
+#         [sys.executable, "-m", "pytest", str(test_file), "-v"],
+#         capture_output=True,
+#         text=True,
+#         cwd=example_test_dir,
+#         check=False,
+#     )
+
+#     # Print output for debugging
+#     print(f"STDOUT: {result.stdout}")
+#     print(f"STDERR: {result.stderr}")
+
+#     # Check if the test passed
+#     assert "1 passed" in result.stdout
+
+#     # Verify the counter - test should have run 3 times
+#     with open(counter_file) as f:
+#         count = int(f.read())
+
+#     assert count == 3, f"Test should run 3 times, but ran {count} times"
