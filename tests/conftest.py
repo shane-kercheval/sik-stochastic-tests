@@ -1,5 +1,4 @@
 """Test fixtures and configuration for pytest plugin tests."""
-import os
 import pytest
 import tempfile
 import shutil
@@ -12,7 +11,7 @@ def temp_dir():
         yield Path(tmp_dir)
 
 @pytest.fixture
-def example_test_dir(temp_dir):
+def example_test_dir(temp_dir: Path):
     """Create a directory with example test files."""
     # Copy our example test files to the temp directory
     example_dir = Path(__file__).parent / "test_examples"
