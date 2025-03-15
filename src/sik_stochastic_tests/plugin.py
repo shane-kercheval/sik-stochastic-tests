@@ -27,15 +27,16 @@ def pytest_configure(config: pytest.Config) -> None:
         "stochastic(samples, threshold, batch_size, retry_on, max_retries, timeout): "
         "mark test to run stochastically multiple times",
     )
-    
+
 def has_asyncio_marker(obj: pytest.Function | object) -> bool:
-    """Check if an object has pytest.mark.asyncio marker.
-    
+    """
+    Check if an object has pytest.mark.asyncio marker.
+
     Works for both test functions and test classes.
-    
+
     Args:
         obj: A pytest function item or any object that might have markers
-        
+
     Returns:
         True if the object has asyncio marker, False otherwise
     """
@@ -44,21 +45,21 @@ def has_asyncio_marker(obj: pytest.Function | object) -> bool:
         for marker in obj.own_markers:
             if marker.name == 'asyncio':
                 return True
-    
+
     # Check if it's in a class with asyncio marker
-    if hasattr(obj, 'cls') and obj.cls is not None:
+    if hasattr(obj, 'cls') and obj.cls is not None:  # noqa: SIM102
         if hasattr(obj.cls, 'pytestmark'):
             for marker in obj.cls.pytestmark:
                 if marker.name == 'asyncio':
                     return True
-                    
+
     # Check if the object itself is a class with pytestmark
-    if hasattr(obj, '__self__') and obj.__self__ is not None:
+    if hasattr(obj, '__self__') and obj.__self__ is not None:  # noqa: SIM102
         if hasattr(obj.__self__.__class__, 'pytestmark'):
             for marker in obj.__self__.__class__.pytestmark:
                 if marker.name == 'asyncio':
                     return True
-                    
+
     return False
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -107,7 +108,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     # Create a new event loop for the test
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
+
     try:
         # Run the stochastic tests
         loop.run_until_complete(
@@ -142,22 +143,23 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     return True  # We handled this test
 
 async def run_test_function(
-    testfunction: callable, 
-    funcargs: dict[str, object], 
-    timeout: int | None = None
+    testfunction: callable,
+    funcargs: dict[str, object],
+    timeout: int | None = None,  # noqa: ASYNC109
 ) -> object:
-    """Execute a test function with optional timeout.
-    
+    """
+    Execute a test function with optional timeout.
+
     Handles both sync and async functions, and properly awaits coroutines.
-    
+
     Args:
         testfunction: The test function to execute
         funcargs: Arguments to pass to the test function
         timeout: Optional timeout in seconds
-        
+
     Returns:
         The result of the function call
-        
+
     Raises:
         TimeoutError: If the function execution exceeds the timeout
         Any exceptions raised by the test function
@@ -166,29 +168,29 @@ async def run_test_function(
     is_async = inspect.iscoroutinefunction(testfunction) or (
         hasattr(testfunction, '__code__') and testfunction.__code__.co_flags & 0x80
     )
-    
+
     # Create a wrapper to execute the function
     if is_async:
         # For async functions
         if timeout is not None:
             try:
                 return await asyncio.wait_for(testfunction(**funcargs), timeout=timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 raise TimeoutError(f"Test timed out after {timeout} seconds")
         else:
             return await testfunction(**funcargs)
-    else:
+    else:  # noqa: PLR5501
         # For sync functions
         if timeout is not None:
             # Run in executor with timeout
-            def run_sync():
+            def run_sync():  # noqa: ANN202
                 return testfunction(**funcargs)
-                
+
             loop = asyncio.get_running_loop()
             future = loop.run_in_executor(None, run_sync)
             try:
                 return await asyncio.wait_for(future, timeout=timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 raise TimeoutError(f"Test timed out after {timeout} seconds")
         else:
             # Direct call for sync functions
@@ -198,7 +200,7 @@ async def run_test_function(
                 return await result
             return result
 
-async def _run_stochastic_tests(  # noqa: PLR0915
+async def _run_stochastic_tests(
         testfunction: callable,
         funcargs: dict[str, object],
         stats: StochasticTestStats,

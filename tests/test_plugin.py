@@ -11,6 +11,95 @@ from sik_stochastic_tests.plugin import (
     pytest_pyfunc_call,
 )
 
+def test_has_asyncio_marker():
+    """Test the has_asyncio_marker helper function."""
+    from sik_stochastic_tests.plugin import has_asyncio_marker
+
+    # Create asyncio marker mock with correct name property
+    asyncio_marker = MagicMock()
+    asyncio_marker.name = 'asyncio'
+
+    # Create non-asyncio marker mock
+    other_marker = MagicMock()
+    other_marker.name = 'other'
+
+    # Create mock objects to test the function
+    class AsyncioClass:
+        pytestmark = [asyncio_marker]  # noqa: RUF012
+
+    class NonAsyncioClass:
+        pytestmark = [other_marker]  # noqa: RUF012
+
+    # Mock a pytest function with asyncio marker
+    func_with_marker = MagicMock()
+    func_with_marker.own_markers = [asyncio_marker]
+
+    # Mock a pytest function without asyncio marker
+    func_without_marker = MagicMock()
+    func_without_marker.own_markers = [other_marker]
+
+    # Mock a pytest function in asyncio class
+    func_in_asyncio_class = MagicMock()
+    func_in_asyncio_class.own_markers = []
+    func_in_asyncio_class.cls = AsyncioClass
+
+    # Mock a method with asyncio class
+    method_obj = MagicMock()
+    method_obj.__self__ = MagicMock()
+    method_obj.__self__.__class__ = AsyncioClass
+
+    # Test the function
+    assert has_asyncio_marker(func_with_marker) is True
+    assert has_asyncio_marker(func_without_marker) is False
+    assert has_asyncio_marker(func_in_asyncio_class) is True
+    assert has_asyncio_marker(method_obj) is True
+
+@pytest.mark.asyncio
+async def test_run_test_function():
+    """Test the run_test_function helper for different types of functions."""
+    from sik_stochastic_tests.plugin import run_test_function
+
+    # Test cases
+    # 1. Synchronous function
+    def sync_func(arg=None):  # noqa: ANN001, ANN202
+        return arg or "sync result"
+
+    # 2. Asynchronous function
+    async def async_func(arg=None):  # noqa: ANN001, ANN202
+        return arg or "async result"
+
+    # 3. Sync function that returns a coroutine
+    def returns_coroutine(arg=None):  # noqa: ANN001, ANN202
+        async def inner():  # noqa: ANN202
+            return arg or "coroutine result"
+        return inner()
+
+    # 4. Function with timeout
+    async def slow_func() -> str:
+        await asyncio.sleep(0.2)
+        return "slow result"
+
+    # Run the tests
+    # Sync functions
+    result1 = await run_test_function(sync_func, {"arg": "test"})
+    assert result1 == "test"
+
+    # Async functions
+    result2 = await run_test_function(async_func, {"arg": "test"})
+    assert result2 == "test"
+
+    # Sync functions returning coroutines
+    result3 = await run_test_function(returns_coroutine, {"arg": "test"})
+    assert result3 == "test"
+
+    # Test timeout handling
+    with pytest.raises(TimeoutError):
+        await run_test_function(slow_func, {}, timeout=0.1)
+
+    # Test successful execution with sufficient timeout
+    result4 = await run_test_function(slow_func, {}, timeout=0.3)
+    assert result4 == "slow result"
+
 def test_stochastic_test_stats():
     """Test the StochasticTestStats class."""
     stats = StochasticTestStats()
@@ -242,29 +331,29 @@ async def test_batch_processing():
     """Test that batch_size correctly limits concurrency."""
     # Simplify the test to just check that the batching works correctly
     # using a single test run with 5 samples and batch_size=2
-    
+
     # Create an array of results to track when tests start and end
     # Using a class to ensure we have proper synchronization
     class TestTracker:
         def __init__(self):
             self.active_count = 0
             self.max_active = 0
-            
-        async def run_test(self):
+
+        async def run_test(self) -> bool:
             # Track the number of active tests
             self.active_count += 1
             self.max_active = max(self.max_active, self.active_count)
-            
+
             # Sleep to simulate work
             await asyncio.sleep(0.1)
-            
+
             # Decrement active count
             self.active_count -= 1
             return True
-    
+
     tracker = TestTracker()
     stats = StochasticTestStats()
-    
+
     # Run a batch of tests with batch_size=2
     await _run_stochastic_tests(
         testfunction=tracker.run_test,
@@ -276,12 +365,12 @@ async def test_batch_processing():
         max_retries=1,
         timeout=None,
     )
-    
+
     # Verify the statistics
     assert stats.total_runs == 5
     assert stats.successful_runs == 5
     assert len(stats.failures) == 0
-    
+
     # Check that we never had more than 2 tests running at once
     assert tracker.max_active <= 2, f"Expected max 2 concurrent tests, got {tracker.max_active}"
 
@@ -438,10 +527,10 @@ def test_with_failures():
     count += 1
     with open("counter.txt", "w") as f:
         f.write(str(count))
-    
+
     # Print diagnostic info to aid debugging
     print(f"Running test iteration {count}", file=sys.stderr)  # Use stderr to make sure we see it
-    
+
     # Force failures on first N runs to guarantee below threshold
     # We need to be below 60% success, so fail 3 out of 5 = 40% success
     if count <= failure_control.FAIL_COUNT:
@@ -594,8 +683,8 @@ async def test_with_both_markers():
     with open(counter_file) as f:
         count = int(f.read())
 
-    assert count == 1, f"Test should run 1 time when delegated to pytest-asyncio, but ran {count} times"
-    
+    assert count == 1, f"Test should run 1 time when delegated to pytest-asyncio, but ran {count} times"  # noqa: E501
+
 def test_asyncio_class_compatibility(example_test_dir: Path):
     """Test that plugin correctly handles tests in a class marked with pytest.mark.asyncio."""
     # Create a counter file to track executions
@@ -645,9 +734,9 @@ class TestAsyncioClass:
 
     # Check if the test passed - our fix should bypass stochastic and let pytest-asyncio handle it
     assert "1 passed" in result.stdout
-    
+
     # Verify the counter - test should run once since we're delegating to pytest-asyncio
     with open(counter_file) as f:
         count = int(f.read())
 
-    assert count == 1, f"Test in asyncio class should run 1 time (not {count}) with our fix that detects and avoids conflict"
+    assert count == 1, f"Test in asyncio class should run 1 time (not {count}) with our fix that detects and avoids conflict"  # noqa: E501
