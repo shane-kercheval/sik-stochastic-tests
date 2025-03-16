@@ -1495,19 +1495,19 @@ def test_cpu_bound_timeout():
         print("✅ Found timeout message in output")
     else:
         print("❌ Timeout message not found in output")
-        
+
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 def test_stochastic_with_parametrize(example_test_dir: Path, is_async: bool):
-    """Test that stochastic tests work correctly with pytest.mark.parametrize for both sync and async tests."""
+    """Test that stochastic tests work correctly with pytest.mark.parametrize for both sync and async tests."""  # noqa: E501
     # Create a counter file to track executions
     counter_file = example_test_dir / "parametrize_counter.txt"
     counter_file.write_text("0")
-    
+
     # Configure based on async or sync
     test_prefix = "async " if is_async else ""
     asyncio_import = "import asyncio\n" if is_async else ""
     sleep_code = "await asyncio.sleep(0.01)\n        " if is_async else ""
-    
+
     # Adding pytest.ini for asyncio_mode if testing async
     if is_async:
         pytest_ini = example_test_dir / "pytest.ini"
@@ -1515,7 +1515,7 @@ def test_stochastic_with_parametrize(example_test_dir: Path, is_async: bool):
 [pytest]
 asyncio_mode = auto
 """)
-    
+
     # Create a test file with parametrize and stochastic
     test_file = example_test_dir / "test_parametrize.py"
     test_file.write_text(f"""
@@ -1526,10 +1526,10 @@ import pytest
 def increment_counter(param_value):
     with open("parametrize_counter.txt", "r") as f:
         count = int(f.read())
-    
+
     with open("parametrize_counter.txt", "w") as f:
         f.write(str(count + 1))
-    
+
     return param_value
 
 @pytest.mark.parametrize("test_input,expected", [
@@ -1541,10 +1541,10 @@ def increment_counter(param_value):
 {test_prefix}def test_with_parameters(test_input, expected):
     # Track this execution
     actual_input = increment_counter(test_input)
-    
+
     # Add a small delay for async tests
     {sleep_code}
-    
+
     # Simple assertion using the parameters
     transformed = actual_input.upper().replace('VALUE', 'EXPECTED')
     assert transformed == expected, f"Expected {{expected}} but got {{transformed}}"
@@ -1558,24 +1558,24 @@ def increment_counter(param_value):
         cwd=example_test_dir,
         check=False,
     )
-    
+
     # Print output for debugging
     print(f"STDOUT: {result.stdout}")
     print(f"STDERR: {result.stderr}")
-    
+
     # Verify the test passed
     assert "2 passed" in result.stdout, f"Expected 2 tests to pass, got: {result.stdout}"
-    
+
     # Read the counter to see how many times the test was executed
     with open(counter_file) as f:
         count = int(f.read())
-    
-    # We should have 2 parametrized tests × 2 samples each = 4 executions
-    assert count == 4, f"Expected 4 executions (2 params × 2 samples), but got {count}"
-    
+
+    # We should have 2 parametrized tests x 2 samples each = 4 executions
+    assert count == 4, f"Expected 4 executions (2 params x 2 samples), but got {count}"
+
     # Check if stochastic reporting is in the output
     assert "Stochastic Test Results" in result.stdout, "Expected stochastic reporting in output"
-    
+
     # Verify that the tests were actually parametrized
     assert "test_with_parameters[value1-EXPECTED1]" in result.stdout
     assert "test_with_parameters[value2-EXPECTED2]" in result.stdout
