@@ -1965,3 +1965,139 @@ class TestAsyncStochasticClass:
     assert "TestAsyncStochasticClass::test_async_method_one" in result.stdout
     assert "TestAsyncStochasticClass::test_async_method_two" in result.stdout
     assert "Stochastic Test Results" in result.stdout
+
+def test_async_http_client_edge_case(example_test_dir: Path):
+    """Test that reproduces the edge case with HTTP clients causing 'pop from an empty deque'."""
+    # Create a counter file to track executions
+    counter_file = example_test_dir / "http_edge_case_counter.txt"
+    counter_file.write_text("0")
+
+    # Add pytest.ini for asyncio mode
+    pytest_ini = example_test_dir / "pytest.ini"
+    pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+asyncio_default_fixture_loop_scope = function
+""")
+
+    # Create a test file that specifically reproduces the edge case
+    test_file = example_test_dir / "test_http_edge_case.py"
+    # Triple quotes with raw string to avoid docstring issues
+    test_file.write_text(r'''
+import pytest
+import asyncio
+import sys
+from contextlib import asynccontextmanager
+
+# Create a class that simulates the behavior of httpx.AsyncClient
+class MockAsyncClient:
+    """Simulates the behavior of httpx.AsyncClient that causes the issue."""
+    
+    def __init__(self, name):
+        self.name = name
+        self.closed = False
+        print(f"Creating {self.name}", file=sys.stderr)
+    
+    async def aclose(self):
+        """Simulates httpx.AsyncClient.aclose() which can cause issues when called concurrently."""
+        if self.closed:
+            return
+        self.closed = True
+        print(f"Closing {self.name}", file=sys.stderr)
+        # Small delay to simulate network closing
+        await asyncio.sleep(0.01)
+        # Create and immediately consume an async generator
+        # This is what triggers the issue in real HTTP clients
+        async for _ in self._cleanup_generator():
+            pass
+        print(f"Closed {self.name}", file=sys.stderr)
+    
+    async def _cleanup_generator(self):
+        """Simulates the internal cleanup generators in HTTP clients."""
+        for i in range(2):
+            await asyncio.sleep(0.01)
+            yield i
+    
+    async def request(self, *args, **kwargs):
+        """Simulates a request that returns a stream."""
+        return self._stream_response()
+    
+    async def _stream_response(self):
+        """Simulates a streaming response like those from OpenAI/Anthropic."""
+        for i in range(3):
+            await asyncio.sleep(0.01)
+            yield f"chunk_{i}"
+
+# Context manager to properly handle the mock client
+@asynccontextmanager
+async def get_client(name):
+    client = MockAsyncClient(name)
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+# Test that uses multiple clients simultaneously
+@pytest.mark.stochastic(samples=5, batch_size=2)  # Force concurrent executions
+@pytest.mark.asyncio
+async def test_multiple_async_clients():
+    """Test that creates multiple mock HTTP clients that use async generators."""
+    # Increment the counter to track executions
+    with open("http_edge_case_counter.txt", "r") as f:
+        count = int(f.read())
+    
+    with open("http_edge_case_counter.txt", "w") as f:
+        f.write(str(count + 1))
+    
+    # Create multiple clients that will be closed simultaneously at the end
+    async with get_client("client1") as client1, get_client("client2") as client2:
+        # Start multiple streaming responses simultaneously
+        response1 = await client1.request("test")
+        response2 = await client2.request("test")
+        
+        # Collect responses from both streams at the same time
+        # This pattern of accessing multiple async generators concurrently
+        # is what causes the empty deque error
+        results = []
+        
+        # Process first stream
+        async for chunk in response1:
+            results.append(chunk)
+            
+            # Process second stream simultaneously to force interleaving
+            if len(results) == 2:  # After collecting 2 chunks from first stream
+                async for chunk in response2:
+                    results.append(chunk)
+    
+    # Simple assertion to make the test pass
+    assert len(results) > 0
+    # The clients will be automatically closed by the context manager,
+    # which will trigger aclose() calls that can cause the error
+''')
+
+    # Run pytest on the file
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v"],
+        capture_output=True,
+        text=True,
+        cwd=example_test_dir,
+        check=False,
+    )
+
+    # Print output for debugging
+    print(f"STDOUT: {result.stdout}")
+    print(f"STDERR: {result.stderr}")
+
+    # Check if the test passed 
+    assert "1 passed" in result.stdout, f"Expected test to pass, got: {result.stdout}"
+
+    # Check counter to see if the test ran completely
+    with open(counter_file) as f:
+        count = int(f.read())
+
+    # The test should run all 5 samples if our fix works
+    assert count == 5, f"Expected test to run 5 times, but ran {count} times"
+
+    # Verify that there's no "pop from an empty deque" error
+    assert "pop from an empty deque" not in result.stderr, "Error still present despite the fix"
+    assert "Event loop is closed" not in result.stderr, "Event loop closed error still present"
