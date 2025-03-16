@@ -1137,7 +1137,6 @@ import pytest
     assert "1 failed" in result.stdout, f"Expected test to fail but got:\n{result.stdout}"
     assert "timeout" in result.stdout.lower(), f"Expected timeout message but got:\n{result.stdout}"  # noqa: E501
 
-
 def test_asyncio_compatibility(example_test_dir: Path):
     """Test that plugin correctly detects and skips tests with asyncio marker."""
     # Create a counter file to track executions
@@ -1338,7 +1337,7 @@ def test_has_asyncio_marker_detects_coroutines():
     assert inspect.iscoroutinefunction(async_func) is True
     assert inspect.iscoroutinefunction(sync_func) is False
 
-def test_terminal_reporting_no_failures(capsys):  # noqa: ANN001, ARG001
+def test_terminal_reporting_no_failures(capsys: pytest.CaptureFixture[str]):  # noqa: ARG001
     """Test terminal reporting when there are no failures."""
     # Create a test result with no failures
     stats = StochasticTestStats()
@@ -1992,12 +1991,12 @@ from contextlib import asynccontextmanager
 # Create a class that simulates the behavior of httpx.AsyncClient
 class MockAsyncClient:
     """Simulates the behavior of httpx.AsyncClient that causes the issue."""
-    
+
     def __init__(self, name):
         self.name = name
         self.closed = False
         print(f"Creating {self.name}", file=sys.stderr)
-    
+
     async def aclose(self):
         """Simulates httpx.AsyncClient.aclose() which can cause issues when called concurrently."""
         if self.closed:
@@ -2011,17 +2010,17 @@ class MockAsyncClient:
         async for _ in self._cleanup_generator():
             pass
         print(f"Closed {self.name}", file=sys.stderr)
-    
+
     async def _cleanup_generator(self):
         """Simulates the internal cleanup generators in HTTP clients."""
         for i in range(2):
             await asyncio.sleep(0.01)
             yield i
-    
+
     async def request(self, *args, **kwargs):
         """Simulates a request that returns a stream."""
         return self._stream_response()
-    
+
     async def _stream_response(self):
         """Simulates a streaming response like those from OpenAI/Anthropic."""
         for i in range(3):
@@ -2045,30 +2044,30 @@ async def test_multiple_async_clients():
     # Increment the counter to track executions
     with open("http_edge_case_counter.txt", "r") as f:
         count = int(f.read())
-    
+
     with open("http_edge_case_counter.txt", "w") as f:
         f.write(str(count + 1))
-    
+
     # Create multiple clients that will be closed simultaneously at the end
     async with get_client("client1") as client1, get_client("client2") as client2:
         # Start multiple streaming responses simultaneously
         response1 = await client1.request("test")
         response2 = await client2.request("test")
-        
+
         # Collect responses from both streams at the same time
         # This pattern of accessing multiple async generators concurrently
         # is what causes the empty deque error
         results = []
-        
+
         # Process first stream
         async for chunk in response1:
             results.append(chunk)
-            
+
             # Process second stream simultaneously to force interleaving
             if len(results) == 2:  # After collecting 2 chunks from first stream
                 async for chunk in response2:
                     results.append(chunk)
-    
+
     # Simple assertion to make the test pass
     assert len(results) > 0
     # The clients will be automatically closed by the context manager,
@@ -2088,7 +2087,7 @@ async def test_multiple_async_clients():
     print(f"STDOUT: {result.stdout}")
     print(f"STDERR: {result.stderr}")
 
-    # Check if the test passed 
+    # Check if the test passed
     assert "1 passed" in result.stdout, f"Expected test to pass, got: {result.stdout}"
 
     # Check counter to see if the test ran completely

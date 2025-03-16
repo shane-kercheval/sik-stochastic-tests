@@ -516,10 +516,10 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     # This is needed because even sync tests use async execution for concurrency
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
+
     # Important: Ensure the loop is still running and set up a custom exception handler
     # This prevents "IndexError: pop from an empty deque" errors in some environments
-    def custom_exception_handler(loop, context):
+    def custom_exception_handler(loop, context) -> None:  # noqa: ANN001
         # This silently absorbs "pop from an empty deque" errors
         # but allows other exceptions to propagate normally
         exc = context.get('exception')
@@ -527,11 +527,11 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
             return
         # For all other exceptions, use the default handler
         loop.default_exception_handler(context)
-    
+
     loop.set_exception_handler(custom_exception_handler)
-    
+
     # Create a dummy task to ensure loop has something in its queue
-    async def dummy() -> None: 
+    async def dummy() -> None:
         # Add an actual await to make the task more robust
         await asyncio.sleep(0)
     loop.create_task(dummy())  # noqa: RUF006
@@ -550,7 +550,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
                 timeout=timeout,
             ),
         )
-        
+
         # Process any remaining tasks to prevent "Event loop is closed" errors
         try:
             # Get all pending tasks and run them to completion if possible
@@ -739,9 +739,9 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
         loop = asyncio.new_event_loop()
         # Set it as the current event loop
         asyncio.set_event_loop(loop)
-        
+
     # Set a custom exception handler that ignores empty deque errors
-    def custom_exception_handler(loop, context):
+    def custom_exception_handler(loop, context) -> None:  # noqa: ANN001
         # This silently absorbs "pop from an empty deque" errors
         # but allows other exceptions to propagate normally
         exc = context.get('exception')
@@ -749,7 +749,7 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
             return
         # For all other exceptions, use the default handler
         loop.default_exception_handler(context)
-    
+
     loop.set_exception_handler(custom_exception_handler)
 
     # Important: Ensure the loop is still running
