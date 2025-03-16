@@ -34,32 +34,32 @@ uv add sik-stochastic-tests
 
 ### Basic Usage
 
-Mark any test with the `stochastic` decorator to run it multiple times:
+Mark any test with the `stochastic` decorator to run it multiple times with a success threshold:
 
 ```python
 import pytest
 
-@pytest.mark.stochastic(samples=5)  # Run 5 times
+@pytest.mark.stochastic(samples=5)  # Run 5 times with default 50% success threshold
 def test_llm_response():
     response = my_llm.generate("What is the capital of France?")
     assert 'paris' in response.lower()
 ```
 
+By default, the test will pass if at least 50% of the runs succeed (3 out of 5 in this example). This is ideal for testing non-deterministic systems where occasional failures are expected and acceptable.
+
 ### Async Tests
 
-For asynchronous tests, you must use **both** the `@pytest.mark.asyncio` and `@pytest.mark.stochastic` decorators:
+For asynchronous tests, you must use **both** the `@pytest.mark.asyncio` and `@pytest.mark.stochastic` decorators (you will need `pytest-asyncio` installed):
 
 ```python
 import pytest
 
 @pytest.mark.asyncio  # Required for async tests
-@pytest.mark.stochastic(samples=5)
+@pytest.mark.stochastic(samples=5)  # Uses default 50% threshold
 async def test_async_llm_response():
     response = await my_async_llm.generate("What is the capital of France?")
     assert 'paris' in response.lower()
 ```
-
-> **Important**: The `@pytest.mark.asyncio` decorator is required for async tests. Make sure you have `pytest-asyncio` installed.
 
 ### Setting a Success Threshold
 
@@ -134,6 +134,23 @@ pytest --disable-stochastic
 ```
 
 This will run each test only once, ignoring the stochastic parameters for both sync and async tests.
+
+## Parameter Defaults
+
+The stochastic marker accepts the following parameters with these defaults:
+
+```python
+@pytest.mark.stochastic(
+    samples=10,       # Run 10 times by default
+    threshold=0.5,    # 50% success rate required by default
+    batch_size=None,  # Run all samples concurrently by default
+    retry_on=None,    # No automatic retries by default
+    max_retries=3,    # Maximum 3 retries if retry_on is specified
+    timeout=None      # No timeout by default
+)
+```
+
+You only need to specify the parameters you want to change from these defaults.
 
 ## Advanced Examples
 
