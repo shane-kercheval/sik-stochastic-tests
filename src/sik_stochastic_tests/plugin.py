@@ -562,6 +562,23 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
             # Ignore errors during cleanup, as we're shutting down anyway
             pass
     finally:
+        try:
+            # Try to close all active async generators before closing the loop
+            # This helps prevent issues with asyncio's generator cleanup
+            if hasattr(loop, 'shutdown_asyncgens'):
+                try:
+                    # Add a short timeout to the shutdown to avoid hanging
+                    shutdown_task = asyncio.ensure_future(loop.shutdown_asyncgens(), loop=loop)
+                    loop.run_until_complete(
+                        asyncio.wait_for(shutdown_task, timeout=0.5)
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    # Ignore timeout or any errors during asyncgen shutdown
+                    pass
+        except Exception:
+            # Ignore any errors during asyncgen shutdown
+            pass
+            
         # Always clean up resources even if there are exceptions
         loop.close()
         # Reset the event loop to avoid interference with pytest-asyncio
@@ -846,6 +863,29 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
 
     # Run the full test synchronously
     loop.run_until_complete(run_full_test())
+    
+    # Process any pending tasks and properly clean up async generators
+    try:
+        # Get all pending tasks and run them to completion if possible
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            # This gives pending tasks (like httpx connection cleanup) a chance to complete
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    except Exception:
+        # Ignore errors during cleanup, as we're shutting down anyway
+        pass
+        
+    # Try to close all active async generators
+    if hasattr(loop, 'shutdown_asyncgens'):
+        try:
+            # Add a short timeout to the shutdown to avoid hanging
+            shutdown_task = asyncio.ensure_future(loop.shutdown_asyncgens(), loop=loop)
+            loop.run_until_complete(
+                asyncio.wait_for(shutdown_task, timeout=0.5)
+            )
+        except (asyncio.TimeoutError, Exception):
+            # Ignore timeout or any errors during asyncgen shutdown
+            pass
 
 async def _run_stochastic_tests(
         testfunction: callable,
