@@ -13,10 +13,12 @@ import sys
 import subprocess
 from unittest.mock import MagicMock
 from sik_stochastic_tests.plugin import (
-    StochasticTestStats,
     _run_stochastic_tests,
+    _test_results,
+    StochasticTestStats,
     pytest_collection_modifyitems,
     pytest_pyfunc_call,
+    pytest_terminal_summary,
     run_stochastic_tests_for_async,
 )
 from typing import Never
@@ -599,6 +601,7 @@ async def test_edge_cases_parameter_validation():
     - Negative or zero samples
     - Invalid retry_on parameters
     - Negative batch size handling
+    - Threshold edge cases
     """
     async def test_func() -> bool:
         return True
@@ -1334,3 +1337,161 @@ def test_has_asyncio_marker_detects_coroutines():
     # Verify our detection is using inspect.iscoroutinefunction
     assert inspect.iscoroutinefunction(async_func) is True
     assert inspect.iscoroutinefunction(sync_func) is False
+
+def test_terminal_reporting_no_failures(capsys):  # noqa: ANN001, ARG001
+    """Test terminal reporting when there are no failures."""
+    # Create a test result with no failures
+    stats = StochasticTestStats()
+    stats.total_runs = 10
+    stats.successful_runs = 10
+
+    # Add to global test results
+    _test_results.clear()  # Ensure we're starting fresh
+    _test_results["test_perfect::test_always_passes"] = stats
+
+    # Create a mock terminal reporter
+    class MockTerminalReporter:
+        def __init__(self):
+            self.lines = []
+
+        def write_sep(self, sep, title) -> None:  # noqa: ANN001
+            self.lines.append(f"{sep*10} {title} {sep*10}")
+
+        def write_line(self, line) -> None:  # noqa: ANN001
+            self.lines.append(line)
+
+    reporter = MockTerminalReporter()
+
+    # Run the terminal summary function
+    pytest_terminal_summary(reporter)
+
+    # Verify correct output
+    assert any("Success rate: 1.00" in line for line in reporter.lines)
+    assert any("Runs: 10, Successes: 10, Failures: 0" in line for line in reporter.lines)
+    # Verify no failure output
+    assert not any("Failure samples:" in line for line in reporter.lines)
+
+    # Clean up
+    _test_results.clear()
+
+@pytest.mark.asyncio
+async def test_event_loop_cleanup_with_exceptions():
+    """Test event loop is properly cleaned up even when tests throw exceptions."""
+    from sik_stochastic_tests.plugin import _run_stochastic_tests, StochasticTestStats
+    import asyncio
+    import gc
+    import weakref
+
+    # Function that always raises an exception
+    async def failing_test() -> Never:
+        raise ValueError("Intentional exception")
+
+    # Use a weak reference to track if the loop is cleaned up
+    loop_ref = None
+
+    async def run_with_new_loop() -> None:
+        # Create a new event loop
+        old_loop = asyncio.get_event_loop()
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+
+        nonlocal loop_ref
+        loop_ref = weakref.ref(new_loop)
+
+        try:
+            # Run tests that will fail
+            stats = StochasticTestStats()
+            await _run_stochastic_tests(
+                testfunction=failing_test,
+                funcargs={},
+                stats=stats,
+                samples=3,
+                batch_size=None,
+                retry_on=None,
+                max_retries=1,
+                timeout=None,
+            )
+
+            # Verify stats are correct
+            assert stats.total_runs == 3
+            assert stats.successful_runs == 0
+            assert len(stats.failures) == 3
+
+        finally:
+            # Restore the original loop
+            asyncio.set_event_loop(old_loop)
+
+    # Run the test with a new loop
+    await run_with_new_loop()
+
+    # Force garbage collection
+    gc.collect()
+
+    # Verify the loop was properly cleaned up (reference should be None)
+    assert loop_ref() is None, "Event loop was not properly cleaned up"
+
+def test_timeout_with_cpu_bound_task(example_test_dir: Path):
+    """Test timeout mechanism with CPU-bound tasks (controlled intensive work)."""
+    # Create a test file with a CPU-bound task that can be timed out
+    test_file = example_test_dir / "test_cpu_timeout.py"
+    test_file.write_text("""
+import pytest
+import time
+import sys
+
+@pytest.mark.stochastic(samples=1, timeout=0.5)
+def test_cpu_bound_timeout():
+    # A CPU-bound task that checks for timeout periodically
+    # This approach allows the test to be terminated by our timeout mechanism
+    start_time = time.time()
+    counter = 0
+
+    # Print to ensure we see output in test results
+    print("Starting CPU-bound test that should timeout after 0.5 seconds", file=sys.stderr)
+
+    try:
+        # Perform intensive calculation but check elapsed time periodically
+        while True:
+            # Do some CPU-intensive work (addition loop)
+            for i in range(1000000):
+                counter += i
+
+            # Log progress
+            elapsed = time.time() - start_time
+            print(f"Progress check: elapsed={elapsed:.2f}s, counter={counter}", file=sys.stderr)
+
+            # Check if we should create a checkpoint for signal handling
+            if elapsed > 5:  # Much longer than our timeout
+                break  # Safety exit to prevent test hanging if timeout fails
+    except Exception as e:
+        print(f"Exception caught: {type(e).__name__}: {e}", file=sys.stderr)
+        raise
+
+    # If we get here, the timeout didn't work or took too long
+    assert False, f"Timeout didn't stop test execution, counter={counter}"
+""")
+
+    # Run pytest on the file with a longer global timeout
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v"],
+        capture_output=True,
+        text=True,
+        cwd=example_test_dir,
+        timeout=15,  # Overall process timeout
+        check=False,
+    )
+
+    # Print output for debugging
+    print("Test output:")
+    print(f"STDOUT:\\n{result.stdout}")
+    print(f"STDERR:\\n{result.stderr}")
+
+    # Test should fail due to timeout
+    assert "1 failed" in result.stdout
+    assert "timeout" in result.stdout.lower() or "TimeoutError" in result.stdout, "Expected timeout failure message"  # noqa: E501
+
+    # Log specific data from the output
+    if "timeout" in result.stdout.lower():
+        print("✅ Found timeout message in output")
+    else:
+        print("❌ Timeout message not found in output")
