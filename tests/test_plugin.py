@@ -1648,6 +1648,248 @@ class TestStochasticClass:
     # Check success rates are correctly reported
     assert "Success rate: 1.00" in result.stdout
 
+def test_async_generator_cleanup_issue(example_test_dir: Path):
+    """Test for the 'pop from an empty deque' issue with multiple async generators."""
+    # Create a counter file to track executions
+    counter_file = example_test_dir / "generator_counter.txt"
+    counter_file.write_text("0")
+
+    # Add pytest.ini for asyncio mode
+    pytest_ini = example_test_dir / "pytest.ini"
+    pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+asyncio_default_fixture_loop_scope = function
+""")
+
+    # Create a test file that simulates the OpenAI async generator pattern
+    # This reproduces the error: "IndexError: pop from an empty deque"
+    test_file = example_test_dir / "test_async_generators.py"
+    # Triple quotes with raw string to avoid docstring issues
+    test_file.write_text(r'''
+import pytest
+import asyncio
+import sys
+
+# Create a simple async generator
+async def async_generator(name, count=3):
+    """Simulate an OpenAI-like async generator."""
+    for i in range(count):
+        await asyncio.sleep(0.01)  # Small delay
+        print(f"Generator {name} yielding {i}", file=sys.stderr)
+        yield f"{name}_{i}"
+
+# Create a consumer that uses multiple generators simultaneously
+async def consume_generators(*generators):
+    """Consume multiple generators together."""
+    # Start all generators
+    gens = [gen.__aiter__() for gen in generators]
+
+    # Process them together
+    try:
+        while True:
+            # Get next items from all generators simultaneously
+            tasks = [asyncio.create_task(gen.__anext__()) for gen in gens]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Check if we're done
+            if all(isinstance(r, StopAsyncIteration) for r in results):
+                break
+
+            # Process valid results
+            valid_results = [r for r in results if not isinstance(r, Exception)]
+            if not valid_results:
+                break
+    except StopAsyncIteration:
+        pass
+
+    # Record execution
+    with open("generator_counter.txt", "r") as f:
+        count = int(f.read())
+
+    with open("generator_counter.txt", "w") as f:
+        f.write(str(count + 1))
+
+    return True
+
+@pytest.mark.stochastic(samples=5, batch_size=2)  # Force concurrent executions
+@pytest.mark.asyncio
+async def test_with_multiple_generators():
+    """Test that creates and consumes multiple async generators simultaneously."""
+    # Create multiple concurrent generators (similar to OpenAI streams)
+    gen1 = async_generator("stream1")
+    gen2 = async_generator("stream2")
+    gen3 = async_generator("stream3")
+
+    # Consume them together, which can trigger the event loop issue
+    await consume_generators(gen1, gen2, gen3)
+
+    # Simple assertion to make the test pass
+    assert True
+''')
+
+    # Run pytest on the file
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v"],
+        capture_output=True,
+        text=True,
+        cwd=example_test_dir,
+        check=False,
+    )
+
+    # Print output for debugging
+    print(f"STDOUT: {result.stdout}")
+    print(f"STDERR: {result.stderr}")
+
+    # Check if the test passed
+    assert "1 passed" in result.stdout, f"Expected test to pass, got: {result.stdout}"
+
+    # Check counter to see if the test ran completely
+    with open(counter_file) as f:
+        count = int(f.read())
+
+    # The test should run all 5 samples if our fix works
+    assert count == 5, f"Expected test to run 5 times, but ran {count} times"
+
+    # Verify that there's no "pop from an empty deque" error
+    assert "pop from an empty deque" not in result.stderr, "Error still present despite the fix"
+    assert "aclose(): asynchronous generator is already running" not in result.stderr, "Generator cleanup issue still present"  # noqa: E501
+
+def test_async_generator_cleanup_extreme_case(example_test_dir: Path):
+    """Test for 'pop from an empty deque' issue with heavy concurrent generator load."""
+    # Create a counter file to track executions
+    counter_file = example_test_dir / "extreme_counter.txt"
+    counter_file.write_text("0")
+
+    # Add pytest.ini for asyncio mode
+    pytest_ini = example_test_dir / "pytest.ini"
+    pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+asyncio_default_fixture_loop_scope = function
+""")
+
+    # Create a test file with an even more aggressive generator pattern
+    test_file = example_test_dir / "test_extreme_generators.py"
+    # Triple quotes with raw string to avoid docstring issues
+    test_file.write_text(r'''
+import pytest
+import asyncio
+import sys
+
+# Create nested generators - this pattern is more likely to
+# cause the empty deque issue when run concurrently
+async def outer_generator(name, count=3):
+    """An outer generator that yields inner generators."""
+    for i in range(count):
+        # Yield an inner generator for each iteration
+        yield inner_generator(f"{name}_{i}")
+
+async def inner_generator(name, count=2):
+    """An inner generator."""
+    for j in range(count):
+        await asyncio.sleep(0.01)
+        print(f"Inner generator {name} yielding {j}", file=sys.stderr)
+        yield f"{name}_inner_{j}"
+
+# Function to consume nested generators
+async def consume_nested_generators(*generators):
+    """Consume multiple nested generators concurrently."""
+    # Track outer generators
+    outer_gens = [gen.__aiter__() for gen in generators]
+    inner_gens = []
+
+    # Process first level
+    try:
+        while outer_gens:
+            # Get next inner generators
+            outer_tasks = [asyncio.create_task(gen.__anext__()) for gen in outer_gens]
+            outer_results = await asyncio.gather(*outer_tasks, return_exceptions=True)
+
+            # Process results and collect inner generators
+            for i, result in enumerate(outer_results):
+                if isinstance(result, StopAsyncIteration):
+                    # This outer generator is exhausted
+                    outer_gens[i] = None
+                elif not isinstance(result, Exception):
+                    # Add the inner generator
+                    inner_gens.append(result.__aiter__())
+
+            # Remove exhausted generators
+            outer_gens = [gen for gen in outer_gens if gen is not None]
+
+            # Process inner generators if we have any
+            if inner_gens:
+                inner_tasks = [asyncio.create_task(gen.__anext__()) for gen in inner_gens]
+                inner_results = await asyncio.gather(*inner_tasks, return_exceptions=True)
+
+                # Process inner results
+                active_inner_gens = []
+                for i, result in enumerate(inner_results):
+                    if not isinstance(result, StopAsyncIteration) and not isinstance(result, Exception):
+                        # Keep this generator for next iteration
+                        active_inner_gens.append(inner_gens[i])
+
+                # Update active inner generators
+                inner_gens = active_inner_gens
+
+    except Exception as e:
+        print(f"Error in consume_nested_generators: {e}", file=sys.stderr)
+
+    # Record successful execution
+    with open("extreme_counter.txt", "r") as f:
+        count = int(f.read())
+
+    with open("extreme_counter.txt", "w") as f:
+        f.write(str(count + 1))
+
+    return True
+
+@pytest.mark.stochastic(samples=5, batch_size=3)  # Run batches concurrently
+@pytest.mark.asyncio
+async def test_with_extreme_generator_pattern():
+    """Test with a complex, nested generator pattern that's more likely to trigger errors."""
+    # Create multiple outer generators
+    gen1 = outer_generator("stream1", count=4)
+    gen2 = outer_generator("stream2", count=4)
+    gen3 = outer_generator("stream3", count=4)
+    gen4 = outer_generator("stream4", count=4)
+
+    # Consume them together, which should trigger the event loop issue
+    # if our fix doesn't work
+    await consume_nested_generators(gen1, gen2, gen3, gen4)
+
+    # Simple assertion to make the test pass
+    assert True
+''')  # noqa: E501
+
+    # Run pytest on the file
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v"],
+        capture_output=True,
+        text=True,
+        cwd=example_test_dir,
+        check=False,
+    )
+
+    # Print output for debugging
+    print(f"STDOUT: {result.stdout}")
+    print(f"STDERR: {result.stderr}")
+
+    # Check if the test passed
+    assert "1 passed" in result.stdout, f"Expected test to pass, got: {result.stdout}"
+
+    # Check counter to see if the test ran completely
+    with open(counter_file) as f:
+        count = int(f.read())
+
+    # The test should run all 5 samples if our fix works
+    assert count == 5, f"Expected test to run 5 times, but ran {count} times"
+
+    # Verify that there's no "pop from an empty deque" error
+    assert "pop from an empty deque" not in result.stderr, "Error still present despite the fix"
+    assert "aclose(): asynchronous generator is already running" not in result.stderr, "Generator cleanup issue still present"  # noqa: E501
+
 def test_stochastic_class_marker_async(example_test_dir: Path):
     """Test that stochastic marker applied to an async class works for all methods within the class."""  # noqa: E501
     # Create a counter file to track executions

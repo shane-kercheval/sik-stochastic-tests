@@ -517,6 +517,13 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # Important: Ensure the loop is still running
+    # This prevents "IndexError: pop from an empty deque" errors in some environments
+    if not loop.is_running():
+        # Create a dummy task to ensure loop has something in its queue
+        async def dummy() -> None: pass
+        loop.create_task(dummy())  # noqa: RUF006
+
     try:
         # Execute the sync test using our async test runner
         loop.run_until_complete(
@@ -709,6 +716,13 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
         loop = asyncio.new_event_loop()
         # Set it as the current event loop
         asyncio.set_event_loop(loop)
+
+    # Important: Ensure the loop is still running
+    # This prevents "IndexError: pop from an empty deque" errors in some environments
+    if not loop.is_running():
+        # Create a dummy task to ensure loop has something in its queue
+        async def dummy() -> None: pass
+        loop.create_task(dummy())  # noqa: RUF006
 
     # Create tasks to run in parallel
     async def run_single_sample(i: int) -> tuple[bool, tuple | None]:
