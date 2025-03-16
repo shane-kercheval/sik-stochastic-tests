@@ -461,8 +461,103 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Disable stochastic mode for tests marked with @stochastic",
     )
 
+# Helper function to run stochastic tests in a separate thread
+def _run_stochastic_tests_in_thread(
+    testfunction: callable,
+    funcargs: dict[str, object],
+    stats: StochasticTestStats,
+    samples: int,
+    batch_size: int | None,
+    retry_on: tuple[Exception] | list[type[Exception]] | None,
+    max_retries: int = 3,
+    timeout: int | None = None,
+) -> None:
+    """
+    Run stochastic tests in a dedicated thread with its own event loop.
+
+    This prevents interference with pytest-asyncio's event loop, fixing issues
+    with 'pop from an empty deque' errors and event loop cleanup.
+
+    Args:
+        testfunction: The test function to execute
+        funcargs: Arguments to pass to the test function
+        stats: Statistics object to track test results
+        samples: Number of times to run the test
+        batch_size: Number of tests to run concurrently
+        retry_on: Exception types that should trigger a retry
+        max_retries: Maximum retry attempts per test
+        timeout: Maximum time in seconds per test execution
+    """
+    import threading
+    import queue
+
+    # Use a queue to get results back from the thread
+    result_queue = queue.Queue()
+
+    def thread_worker() -> None:
+        """Run all stochastic test samples in an isolated thread with its own event loop."""
+        try:
+            # Create a new event loop specific to this thread
+            thread_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(thread_loop)
+
+            # Set custom error handler to catch empty deque errors
+            def custom_exception_handler(loop, context) -> None:  # noqa: ANN001, ARG001
+                exc = context.get('exception')
+                if isinstance(exc, IndexError) and str(exc) == "pop from an empty deque":
+                    # Silently ignore this specific error
+                    return
+                # Use default handler for all other errors
+                thread_loop.default_exception_handler(context)
+
+            thread_loop.set_exception_handler(custom_exception_handler)
+
+            # Create a dummy task to ensure the loop queue is never empty
+            async def dummy() -> None:
+                await asyncio.sleep(0)
+            thread_loop.create_task(dummy())  # noqa: RUF006
+
+            try:
+                # Run all test samples in this thread's event loop
+                thread_loop.run_until_complete(
+                    _run_stochastic_tests(
+                        testfunction=testfunction,
+                        funcargs=funcargs,
+                        stats=stats,
+                        samples=samples,
+                        batch_size=batch_size,
+                        retry_on=retry_on,
+                        max_retries=max_retries,
+                        timeout=timeout,
+                    ),
+                )
+                result_queue.put(("success", None))
+            except Exception as e:
+                # Pass any exceptions back to the main thread
+                result_queue.put(("error", e))
+            finally:
+                # Always clean up the loop
+                thread_loop.close()
+                # Reset this thread's event loop
+                asyncio.set_event_loop(None)
+        except Exception as e:
+            # Catch any unexpected errors in thread setup
+            result_queue.put(("error", e))
+
+    # Create and start the worker thread
+    worker_thread = threading.Thread(target=thread_worker, daemon=True)
+    worker_thread.start()
+    worker_thread.join()  # Wait for thread to complete
+
+    # Get results from the thread
+    if not result_queue.empty():
+        status, exception = result_queue.get()
+        if status == "error" and exception is not None:
+            # Re-raise any exceptions that occurred in the thread
+            raise exception
+
 @pytest.hookimpl(tryfirst=True)
-def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:  # noqa: PLR0915
+def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     """
     Custom test execution hook for synchronous stochastic tests.
 
@@ -512,77 +607,18 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:  # noqa: PLR
     actual_argnames = set(sig.parameters.keys())
     funcargs = {name: arg for name, arg in pyfuncitem.funcargs.items() if name in actual_argnames}
 
-    # Create a new event loop for running sync tests via our async helper
-    # This is needed because even sync tests use async execution for concurrency
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    # Important: Ensure the loop is still running and set up a custom exception handler
-    # This prevents "IndexError: pop from an empty deque" errors in some environments
-    def custom_exception_handler(loop, context) -> None:  # noqa: ANN001
-        # This silently absorbs "pop from an empty deque" errors
-        # but allows other exceptions to propagate normally
-        exc = context.get('exception')
-        if isinstance(exc, IndexError) and str(exc) == "pop from an empty deque":
-            return
-        # For all other exceptions, use the default handler
-        loop.default_exception_handler(context)
-
-    loop.set_exception_handler(custom_exception_handler)
-
-    # Create a dummy task to ensure loop has something in its queue
-    async def dummy() -> None:
-        # Add an actual await to make the task more robust
-        await asyncio.sleep(0)
-    loop.create_task(dummy())  # noqa: RUF006
-
-    try:
-        # Execute the sync test using our async test runner
-        loop.run_until_complete(
-            _run_stochastic_tests(
-                testfunction=testfunction,
-                funcargs=funcargs,
-                stats=stats,
-                samples=samples,
-                batch_size=batch_size,
-                retry_on=retry_on,
-                max_retries=max_retries,
-                timeout=timeout,
-            ),
-        )
-
-        # Process any remaining tasks to prevent "Event loop is closed" errors
-        try:
-            # Get all pending tasks and run them to completion if possible
-            pending = asyncio.all_tasks(loop)
-            if pending:
-                # This gives pending tasks (like httpx connection cleanup) a chance to complete
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        except Exception:
-            # Ignore errors during cleanup, as we're shutting down anyway
-            pass
-    finally:
-        try:
-            # Try to close all active async generators before closing the loop
-            # This helps prevent issues with asyncio's generator cleanup
-            if hasattr(loop, 'shutdown_asyncgens'):
-                try:
-                    # Add a short timeout to the shutdown to avoid hanging
-                    shutdown_task = asyncio.ensure_future(loop.shutdown_asyncgens(), loop=loop)
-                    loop.run_until_complete(
-                        asyncio.wait_for(shutdown_task, timeout=0.5),
-                    )
-                except (TimeoutError, Exception):
-                    # Ignore timeout or any errors during asyncgen shutdown
-                    pass
-        except Exception:
-            # Ignore any errors during asyncgen shutdown
-            pass
-
-        # Always clean up resources even if there are exceptions
-        loop.close()
-        # Reset the event loop to avoid interference with pytest-asyncio
-        asyncio.set_event_loop(None)
+    # Run stochastic tests in a separate thread with its own event loop
+    # This isolates our tests from pytest-asyncio's event loop, fixing the "pop from empty deque" error  # noqa: E501
+    _run_stochastic_tests_in_thread(
+        testfunction=testfunction,
+        funcargs=funcargs,
+        stats=stats,
+        samples=samples,
+        batch_size=batch_size,
+        retry_on=retry_on,
+        max_retries=max_retries,
+        timeout=timeout,
+    )
 
     # Store test results for terminal reporting
     _test_results[pyfuncitem.nodeid] = stats
@@ -598,6 +634,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:  # noqa: PLR
         raise AssertionError(message)
 
     return True  # Signal to pytest that we handled the test execution
+
 
 async def run_test_function(
     testfunction: callable,
@@ -663,229 +700,6 @@ async def run_test_function(
             if inspect.isawaitable(result):
                 return await result
             return result
-
-def run_stochastic_tests_for_async(  # noqa: PLR0915
-        testfunction: callable,
-        funcargs: dict[str, object],
-        stats: StochasticTestStats,
-        samples: int,
-        batch_size: int | None,
-        retry_on: tuple[Exception] | list[type[Exception]] | None,
-        max_retries: int = 3,
-        timeout: int | None = None,
-    ) -> None:
-    """
-    Run stochastic tests for async functions using the existing event loop.
-
-    This function handles the parallel execution of async test functions,
-    with batching and retry capabilities. It uses the current event loop
-    rather than creating a new one, which is more efficient for async tests.
-
-    The key advantage of this function is its ability to control concurrency
-    through batching, which helps prevent resource exhaustion when running
-    many samples of resource-intensive tests (like network calls or database operations).
-
-    It's used primarily for:
-    1. Direct calls from non-pytest code
-    2. Tests run through the pytest test execution hook
-
-    Args:
-        testfunction: The async test function to execute
-        funcargs: Arguments to pass to the test function
-        stats: Statistics object to track test results
-        samples: Number of times to run the test (must be positive)
-        batch_size: Number of tests to run concurrently (None or <= 0 runs all at once)
-        retry_on: Exception types that should trigger a retry
-        max_retries: Maximum number of retry attempts per test
-        timeout: Maximum time in seconds for each test execution
-
-    Raises:
-        ValueError: If samples is not positive or if retry_on contains non-exception types
-    """
-    # Validate inputs
-    if samples <= 0:
-        raise ValueError("samples must be a positive integer")
-
-    # Validate retry_on contains only exception types
-    if retry_on is not None:
-        for exc in retry_on:
-            if not isinstance(exc, type) or not issubclass(exc, Exception):
-                raise ValueError(f"retry_on must contain only exception types, got {exc}")
-
-    # Normalize batch_size
-    if batch_size is not None and batch_size <= 0:
-        batch_size = None  # Treat negative or zero batch_size as None
-
-    async def run_test_with_timeout(run_index: int, attempt: int) -> tuple[bool, object]:
-        """Helper to run a single test with timeout handling."""
-        context = {"run_index": run_index}
-
-        try:
-            run_args = funcargs.copy()
-
-            if timeout is not None:
-                try:
-                    # Filter arguments to only pass those the function accepts
-                    sig = inspect.signature(testfunction)
-                    actual_argnames = set(sig.parameters.keys())
-                    filtered_args = {name: arg for name, arg in run_args.items() if name in actual_argnames}  # noqa: E501
-
-                    await asyncio.wait_for(testfunction(**filtered_args), timeout=timeout)
-                except TimeoutError:
-                    raise TimeoutError(f"Test timed out after {timeout} seconds")
-            else:
-                # Filter arguments to only pass those the function accepts
-                sig = inspect.signature(testfunction)
-                actual_argnames = set(sig.parameters.keys())
-                filtered_args = {name: arg for name, arg in run_args.items() if name in actual_argnames}  # noqa: E501
-
-                await testfunction(**filtered_args)
-
-            return True, None
-        except Exception as e:
-            if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:
-                return False, "retry"
-            else:  # noqa: RET505
-                return False, (str(e), type(e).__name__, context)
-
-    # Get the current loop, or create a new one to handle deprecation
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No running event loop, create a new one
-        loop = asyncio.new_event_loop()
-        # Set it as the current event loop
-        asyncio.set_event_loop(loop)
-
-    # Set a custom exception handler that ignores empty deque errors
-    def custom_exception_handler(loop, context) -> None:  # noqa: ANN001
-        # This silently absorbs "pop from an empty deque" errors
-        # but allows other exceptions to propagate normally
-        exc = context.get('exception')
-        if isinstance(exc, IndexError) and str(exc) == "pop from an empty deque":
-            return
-        # For all other exceptions, use the default handler
-        loop.default_exception_handler(context)
-
-    loop.set_exception_handler(custom_exception_handler)
-
-    # Important: Ensure the loop is still running
-    # This prevents "IndexError: pop from an empty deque" errors in some environments
-    if not loop.is_running():
-        # Create a dummy task to ensure loop has something in its queue
-        async def dummy() -> None: pass
-        loop.create_task(dummy())  # noqa: RUF006
-
-    # Create tasks to run in parallel
-    async def run_single_sample(i: int) -> tuple[bool, tuple | None]:
-        # For each sample, try up to max_retries times
-        for attempt in range(max_retries):
-            success, result = await run_test_with_timeout(i, attempt)
-
-            if success:
-                # Test passed
-                return True, None
-            if result == "retry":
-                # Retry the test if we haven't exhausted all attempts
-                if attempt < max_retries - 1:
-                    continue
-                # Otherwise, mark as a retry exhaustion
-                return False, (f"Test failed after {max_retries} attempts", "RetryError", {"run_index": i})  # noqa: E501
-            # Test failed, return the failure details
-            return False, result
-        # If we exhausted all retries (defensive programming - this line should never be reached)
-        return False, (f"Test failed after {max_retries} attempts", "RetryError", {"run_index": i})
-
-    # Run tasks with optional batching
-    async def run_full_test() -> None:  # noqa: PLR0912
-        tasks = [run_single_sample(i) for i in range(samples)]
-
-        # Run in batches if batch_size is specified
-        if batch_size and batch_size > 0:
-            for i in range(0, len(tasks), batch_size):
-                batch = tasks[i:i + batch_size]
-                batch_results = await asyncio.gather(*batch, return_exceptions=True)
-
-                # Process results for this batch
-                for result in batch_results:
-                    if isinstance(result, Exception):
-                        # Handle unexpected exceptions
-                        stats.total_runs += 1
-                        stats.failures.append({
-                            "error": str(result),
-                            "type": type(result).__name__,
-                            "context": {"unexpected_error": True},
-                        })
-                    else:
-                        # Unpack the success flag and result
-                        success, error_info = result
-                        stats.total_runs += 1
-
-                        if success:
-                            stats.successful_runs += 1
-                        else:
-                            # Add the failure details
-                            error_msg, error_type, context = error_info
-                            stats.failures.append({
-                                "error": error_msg,
-                                "type": error_type,
-                                "context": context,
-                            })
-        else:
-            # Run all tests at once
-            all_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Process all results
-            for result in all_results:
-                if isinstance(result, Exception):
-                    # Handle unexpected exceptions
-                    stats.total_runs += 1
-                    stats.failures.append({
-                        "error": str(result),
-                        "type": type(result).__name__,
-                        "context": {"unexpected_error": True},
-                    })
-                else:
-                    # Unpack the success flag and result
-                    success, error_info = result
-                    stats.total_runs += 1
-
-                    if success:
-                        stats.successful_runs += 1
-                    else:
-                        # Add the failure details
-                        error_msg, error_type, context = error_info
-                        stats.failures.append({
-                            "error": error_msg,
-                            "type": error_type,
-                            "context": context,
-                        })
-
-    # Run the full test synchronously
-    loop.run_until_complete(run_full_test())
-
-    # Process any pending tasks and properly clean up async generators
-    try:
-        # Get all pending tasks and run them to completion if possible
-        pending = asyncio.all_tasks(loop)
-        if pending:
-            # This gives pending tasks (like httpx connection cleanup) a chance to complete
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-    except Exception:
-        # Ignore errors during cleanup, as we're shutting down anyway
-        pass
-
-    # Try to close all active async generators
-    if hasattr(loop, 'shutdown_asyncgens'):
-        try:
-            # Add a short timeout to the shutdown to avoid hanging
-            shutdown_task = asyncio.ensure_future(loop.shutdown_asyncgens(), loop=loop)
-            loop.run_until_complete(
-                asyncio.wait_for(shutdown_task, timeout=0.5),
-            )
-        except (TimeoutError, Exception):
-            # Ignore timeout or any errors during asyncgen shutdown
-            pass
 
 async def _run_stochastic_tests(
         testfunction: callable,

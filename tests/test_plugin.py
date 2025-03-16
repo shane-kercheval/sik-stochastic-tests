@@ -14,12 +14,12 @@ import subprocess
 from unittest.mock import MagicMock
 from sik_stochastic_tests.plugin import (
     _run_stochastic_tests,
+    _run_stochastic_tests_in_thread,
     _test_results,
     StochasticTestStats,
     pytest_collection_modifyitems,
     pytest_pyfunc_call,
     pytest_terminal_summary,
-    run_stochastic_tests_for_async,
 )
 from typing import Never
 
@@ -507,7 +507,7 @@ def test_async_batch_processing():
     """
     Test batching mechanism in the async-specific test runner.
 
-    This test verifies that the specialized run_stochastic_tests_for_async function:
+    This test verifies that the specialized _run_stochastic_tests_in_thread function:
     - Properly implements concurrent execution with batching
     - Respects batch size limits when specified
     - Runs with higher concurrency when no batching is used
@@ -517,7 +517,7 @@ def test_async_batch_processing():
     to avoid creating unnecessary event loops.
     """
     import asyncio
-    from sik_stochastic_tests.plugin import run_stochastic_tests_for_async
+    from sik_stochastic_tests.plugin import _run_stochastic_tests_in_thread
 
     class AsyncTestTracker:
         def __init__(self):
@@ -545,7 +545,7 @@ def test_async_batch_processing():
     tracker = AsyncTestTracker()
     stats = StochasticTestStats()
 
-    run_stochastic_tests_for_async(
+    _run_stochastic_tests_in_thread(
         testfunction=tracker.test_func,
         funcargs={},
         stats=stats,
@@ -568,7 +568,7 @@ def test_async_batch_processing():
     tracker2 = AsyncTestTracker()
     stats2 = StochasticTestStats()
 
-    run_stochastic_tests_for_async(
+    _run_stochastic_tests_in_thread(
         testfunction=tracker2.test_func,
         funcargs={},
         stats=stats2,
@@ -662,9 +662,9 @@ async def test_edge_cases_parameter_validation():
     assert stats.total_runs == 1
     assert stats.successful_runs == 1
 
-    # Test the same validations for run_stochastic_tests_for_async
+    # Test the same validations for _run_stochastic_tests_in_thread
     with pytest.raises(ValueError, match="samples must be a positive integer"):
-        run_stochastic_tests_for_async(
+        _run_stochastic_tests_in_thread(
             testfunction=test_func,
             funcargs={},
             stats=stats,
@@ -676,7 +676,7 @@ async def test_edge_cases_parameter_validation():
         )
 
     with pytest.raises(ValueError, match="retry_on must contain only exception types"):
-        run_stochastic_tests_for_async(
+        _run_stochastic_tests_in_thread(
             testfunction=test_func,
             funcargs={},
             stats=stats,
@@ -806,7 +806,7 @@ def test_retry_exhaustion():
     stats = StochasticTestStats()
 
     # Run with retries, but it will still fail after max_retries
-    run_stochastic_tests_for_async(
+    _run_stochastic_tests_in_thread(
         testfunction=tracker.always_fail,
         funcargs={},
         stats=stats,
