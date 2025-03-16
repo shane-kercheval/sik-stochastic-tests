@@ -4,7 +4,7 @@ A pytest plugin for testing non-deterministic systems such as LLMs, running test
 
 ## Overview
 
-When testing non-deterministic systems such as large language models, traditional pass/fail testing is problematic because of sporatic errors or response inconsistencies. This plugin allows you to run tests multiple times and determine success based on a threshold, ensuring your tests are reliable even with occasional random failures.
+When testing non-deterministic systems such as large language models, traditional pass/fail testing is problematic because of sporadic errors or response inconsistencies. This plugin allows you to run tests multiple times and determine success based on a threshold, ensuring your tests are reliable even with occasional random failures.
 
 ## Features
 
@@ -14,7 +14,7 @@ When testing non-deterministic systems such as large language models, traditiona
 - Retry capability for flaky tests
 - Timeout control for long-running tests
 - Detailed reporting of success rates and failure patterns
-- Support for both synchronous and asynchronous tests
+- Full support for both synchronous and asynchronous tests
 
 ## Installation
 
@@ -42,6 +42,22 @@ def test_llm_response():
     response = my_llm.generate("What is the capital of France?")
     assert 'paris' in response.lower()
 ```
+
+### Async Tests
+
+For asynchronous tests, you must use **both** the `@pytest.mark.asyncio` and `@pytest.mark.stochastic` decorators:
+
+```python
+import pytest
+
+@pytest.mark.asyncio  # Required for async tests
+@pytest.mark.stochastic(samples=5)
+async def test_async_llm_response():
+    response = await my_async_llm.generate("What is the capital of France?")
+    assert 'paris' in response.lower()
+```
+
+> **Important**: The `@pytest.mark.asyncio` decorator is required for async tests. Make sure you have `pytest-asyncio` installed.
 
 ### Setting a Success Threshold
 
@@ -75,9 +91,17 @@ def test_with_retry():
 Set a timeout for long-running tests:
 
 ```python
+# For synchronous tests
 @pytest.mark.stochastic(samples=3, timeout=5.0)  # 5 second timeout
-async def test_with_timeout():
-    result = await long_running_operation()
+def test_with_timeout():
+    result = long_running_operation()
+    assert result.is_valid
+
+# For asynchronous tests
+@pytest.mark.asyncio
+@pytest.mark.stochastic(samples=3, timeout=5.0)  # 5 second timeout
+async def test_async_with_timeout():
+    result = await async_long_running_operation()
     assert result.is_valid
 ```
 
@@ -86,8 +110,15 @@ async def test_with_timeout():
 Control concurrency with batch processing:
 
 ```python
+# Works for both sync and async tests
 @pytest.mark.stochastic(samples=20, batch_size=5)  # Run 5 at a time
-async def test_with_batching():
+def test_with_batching():
+    result = my_operation()
+    assert result.success
+
+@pytest.mark.asyncio
+@pytest.mark.stochastic(samples=20, batch_size=5)  # Run 5 at a time
+async def test_async_with_batching():
     result = await async_operation()
     assert result.success
 ```
@@ -99,6 +130,8 @@ Temporarily disable stochastic behavior with a command-line flag:
 ```bash
 pytest --disable-stochastic
 ```
+
+This will run each test only once, ignoring the stochastic parameters for both sync and async tests.
 
 ## Advanced Examples
 
@@ -120,9 +153,10 @@ def test_llm_instruction_following():
     assert syllable_counts == [5, 7, 5], f"Should follow 5-7-5 pattern, got {syllable_counts}"
 ```
 
-### Testing with External APIs
+### Testing with External APIs (Async)
 
 ```python
+@pytest.mark.asyncio  # Required for async tests
 @pytest.mark.stochastic(
     samples=5, 
     threshold=0.8,
@@ -143,9 +177,46 @@ async def test_weather_api():
     assert 0 <= response["humidity"] <= 100      # Percentage
 ```
 
+### Combining Multiple Features
+
+```python
+# Synchronous example with multiple features
+@pytest.mark.stochastic(
+    samples=20,
+    threshold=0.9,
+    batch_size=5,
+    retry_on=[ConnectionError, TimeoutError],
+    max_retries=2,
+    timeout=3.0
+)
+def test_complex_scenario():
+    # This test will:
+    # - Run 20 times total
+    # - Run 5 at a time (batched)
+    # - Pass if at least 18 runs succeed (90% threshold)
+    # - Retry on connection or timeout errors (up to 2 retries)
+    # - Timeout after 3 seconds for each run
+    result = complex_operation()
+    assert result.is_successful
+
+# Asynchronous equivalent
+@pytest.mark.asyncio
+@pytest.mark.stochastic(
+    samples=20,
+    threshold=0.9,
+    batch_size=5,
+    retry_on=[ConnectionError, TimeoutError],
+    max_retries=2,
+    timeout=3.0
+)
+async def test_async_complex_scenario():
+    result = await async_complex_operation()
+    assert result.is_successful
+```
+
 ## Test Result Output
 
-The plugin provides detailed test results in the console:
+The plugin provides detailed test results in the console for both synchronous and asynchronous tests:
 
 ```
 =========================== Stochastic Test Results ===========================
@@ -156,7 +227,35 @@ test_llm.py::test_llm_instruction_following:
   Failure samples:
     1. AssertionError: Should follow 5-7-5 pattern, got [4, 6, 5]
     2. AssertionError: Should mention programming
+
+test_async.py::test_async_weather_api:
+  Success rate: 0.60
+  Runs: 5, Successes: 3, Failures: 2
+  Failure samples:
+    1. TimeoutError: Test timed out after 10.0 seconds
+    2. AssertionError: 'temperature' not in response
 ```
+
+## Requirements for Async Tests
+
+1. `pytest-asyncio` must be installed:
+   ```bash
+   pip install pytest-asyncio
+   ```
+
+2. Each async test must have both decorators:
+   ```python
+   @pytest.mark.asyncio
+   @pytest.mark.stochastic(...)
+   async def test_something():
+       ...
+   ```
+
+3. For pytest.ini configuration, you might want to set:
+   ```ini
+   [pytest]
+   asyncio_mode = auto
+   ```
 
 ## Configuration
 
@@ -172,6 +271,24 @@ addopts = "--disable-stochastic"
 
 - Python 3.11+
 - pytest 8.0+
+- pytest-asyncio 0.21+ (for async tests)
+
+## Troubleshooting
+
+### Async Tests Not Running Multiple Times
+
+If your async tests are only running once instead of the specified number of samples:
+
+1. Check that you have **both** `@pytest.mark.asyncio` and `@pytest.mark.stochastic` decorators
+2. Ensure pytest-asyncio is installed
+3. Check that `--disable-stochastic` flag is not present
+
+### Timeout Not Working for Async Tests
+
+Timeouts for async tests are implemented using `asyncio.wait_for()`. If your timeouts aren't working:
+
+1. Ensure you're using a recent version of this plugin
+2. Make sure your test is actually running asynchronously
 
 ## Contributing
 
