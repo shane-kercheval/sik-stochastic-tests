@@ -1579,3 +1579,147 @@ def increment_counter(param_value):
     # Verify that the tests were actually parametrized
     assert "test_with_parameters[value1-EXPECTED1]" in result.stdout
     assert "test_with_parameters[value2-EXPECTED2]" in result.stdout
+
+def test_stochastic_class_marker(example_test_dir: Path):
+    """Test that stochastic marker applied to a class works for all methods within the class."""
+    # Create a counter file to track executions
+    counter_file = example_test_dir / "class_counter.txt"
+    counter_file.write_text("0")
+
+    # Create a test file with a class that has the stochastic marker
+    test_file = example_test_dir / "test_class_marker.py"
+    test_file.write_text("""
+import pytest
+
+# Track execution count
+def increment_counter(method_name):
+    with open("class_counter.txt", "r") as f:
+        count = int(f.read())
+
+    with open("class_counter.txt", "w") as f:
+        f.write(str(count + 1))
+
+    print(f"Executed {method_name} (count {count+1})")
+    return count + 1
+
+@pytest.mark.stochastic(samples=3)
+class TestStochasticClass:
+    \"\"\"A test class with stochastic marker that should apply to all methods.\"\"\"
+
+    def test_method_one(self):
+        \"\"\"First test method.\"\"\"
+        increment_counter("test_method_one")
+        assert True
+
+    def test_method_two(self):
+        \"\"\"Second test method.\"\"\"
+        increment_counter("test_method_two")
+        assert True
+""")
+
+    # Run pytest on the file
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v"],
+        capture_output=True,
+        text=True,
+        cwd=example_test_dir,
+        check=False,
+    )
+
+    # Print output for debugging
+    print(f"STDOUT: {result.stdout}")
+    print(f"STDERR: {result.stderr}")
+
+    # Verify the test passed
+    assert "2 passed" in result.stdout, f"Expected 2 tests to pass, got: {result.stdout}"
+
+    # Read the counter to see how many times the tests were executed
+    with open(counter_file) as f:
+        count = int(f.read())
+
+    # We should have 2 test methods x 3 samples each = 6 executions
+    assert count == 6, f"Expected 6 executions (2 methods x 3 samples), but got {count}"
+
+    # Check if stochastic reporting is in the output for each test method
+    assert "test_class_marker.py::TestStochasticClass::test_method_one" in result.stdout
+    assert "test_class_marker.py::TestStochasticClass::test_method_two" in result.stdout
+    assert "Stochastic Test Results" in result.stdout
+
+    # Check success rates are correctly reported
+    assert "Success rate: 1.00" in result.stdout
+
+def test_stochastic_class_marker_async(example_test_dir: Path):
+    """Test that stochastic marker applied to an async class works for all methods within the class."""  # noqa: E501
+    # Create a counter file to track executions
+    counter_file = example_test_dir / "async_class_counter.txt"
+    counter_file.write_text("0")
+
+    # Adding pytest.ini for asyncio_mode
+    pytest_ini = example_test_dir / "pytest.ini"
+    pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+""")
+
+    # Create a test file with a class that has the stochastic marker
+    test_file = example_test_dir / "test_async_class_marker.py"
+    test_file.write_text("""
+import pytest
+import asyncio
+
+# Track execution count
+def increment_counter(method_name):
+    with open("async_class_counter.txt", "r") as f:
+        count = int(f.read())
+
+    with open("async_class_counter.txt", "w") as f:
+        f.write(str(count + 1))
+
+    print(f"Executed {method_name} (count {count+1})")
+    return count + 1
+
+@pytest.mark.stochastic(samples=3)
+@pytest.mark.asyncio
+class TestAsyncStochasticClass:
+    \"\"\"A test class with stochastic and asyncio markers.\"\"\"
+
+    async def test_async_method_one(self):
+        \"\"\"First async test method.\"\"\"
+        increment_counter("test_async_method_one")
+        await asyncio.sleep(0.01)
+        assert True
+
+    async def test_async_method_two(self):
+        \"\"\"Second async test method.\"\"\"
+        increment_counter("test_async_method_two")
+        await asyncio.sleep(0.01)
+        assert True
+""")
+
+    # Run pytest on the file
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v"],
+        capture_output=True,
+        text=True,
+        cwd=example_test_dir,
+        check=False,
+    )
+
+    # Print output for debugging
+    print(f"STDOUT: {result.stdout}")
+    print(f"STDERR: {result.stderr}")
+
+    # Verify the test passed
+    assert "2 passed" in result.stdout, f"Expected 2 tests to pass, got: {result.stdout}"
+
+    # Read the counter to see how many times the tests were executed
+    with open(counter_file) as f:
+        count = int(f.read())
+
+    # We should have 2 test methods x 3 samples each = 6 executions
+    assert count == 6, f"Expected 6 executions (2 methods x 3 samples), but got {count}"
+
+    # Check if stochastic reporting is in the output for each test method
+    assert "TestAsyncStochasticClass::test_async_method_one" in result.stdout
+    assert "TestAsyncStochasticClass::test_async_method_two" in result.stdout
+    assert "Stochastic Test Results" in result.stdout
