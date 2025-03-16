@@ -1,5 +1,6 @@
 """Unit tests for the stochastic plugin components."""
 from pathlib import Path
+import time
 import pytest
 import asyncio
 import sys
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock
 from sik_stochastic_tests.plugin import (
     StochasticTestStats,
     _run_stochastic_tests,
+    pytest_collection_modifyitems,
     pytest_pyfunc_call,
     run_stochastic_tests_for_async,
 )
@@ -609,6 +611,110 @@ async def test_edge_cases_parameter_validation():
             max_retries=1,
             timeout=None,
         )
+
+def test_async_wrapper_parallel_execution():
+    """Test that the async wrapper executes tests in parallel with appropriate batching."""
+    # Track execution times with this class
+    class ParallelTracker:
+        def __init__(self):
+            self.start_times = []
+            self.end_times = []
+            self.lock = asyncio.Lock()
+
+        async def slow_test(self) -> bool:
+            """A test that takes some time to execute."""
+            async with self.lock:
+                self.start_times.append(time.time())
+
+            # Sleep to simulate work - this is what should happen in parallel
+            await asyncio.sleep(0.1)
+
+            async with self.lock:
+                self.end_times.append(time.time())
+            return True
+
+    # Create a test class to simulate collection
+    class MockItem:
+        def __init__(self, tracker, samples, batch_size):  # noqa: ANN001
+            # Create marker
+            self.marker = type('MockMarker', (), {
+                'kwargs': {
+                    'samples': samples,
+                    'batch_size': batch_size,
+                    'threshold': 0.5,
+                },
+            })
+            self.obj = tracker.slow_test
+            self.nodeid = f"test_parallel_{samples}_{batch_size}"
+
+        def get_closest_marker(self, name):  # noqa: ANN001, ANN202
+            if name == "stochastic":
+                return self.marker
+            if name == "asyncio":
+                return True  # Just need a truthy value
+            return None
+
+    # Create a mock config
+    mock_config = type('MockConfig', (), {'getoption': lambda self, x, y=None: False})  # noqa: ARG005
+
+    # Test sequential vs. parallel execution
+    async def run_test(samples, batch_size):  # noqa: ANN001, ANN202
+        tracker = ParallelTracker()
+        mock_item = MockItem(tracker, samples, batch_size)
+
+        # Create a collection that just has our one item
+        pytest_collection_modifyitems(None, mock_config, [mock_item])
+
+        # The modified item should now have our stochastic wrapper
+        # We need to call it to execute the test
+        await mock_item.obj()
+
+        # Calculate duration for each test
+        durations = []
+        for start, end in zip(tracker.start_times, tracker.end_times):
+            durations.append(end - start)
+
+        # Calculate total wall clock time
+        total_time = max(tracker.end_times) - min(tracker.start_times)
+
+        return {
+            'samples': samples,
+            'batch_size': batch_size,
+            'start_times': tracker.start_times,
+            'end_times': tracker.end_times,
+            'durations': durations,
+            'total_time': total_time,
+        }
+
+    # Run tests with different configurations in a pytest event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        # Test with 5 samples, no batching - should run in parallel
+        results_parallel = loop.run_until_complete(run_test(5, None))
+
+        # Test with 5 samples, batch_size=1 - should run sequentially
+        results_sequential = loop.run_until_complete(run_test(5, 1))
+
+        # With batching=2, should be somewhere in between
+        results_batched = loop.run_until_complete(run_test(5, 2))
+    finally:
+        loop.close()
+
+    # Parallel execution should be much faster than sequential
+    # Each test takes 0.1s, so 5 tests should take ~0.1s in parallel vs ~0.5s sequentially
+    assert results_parallel['total_time'] < results_sequential['total_time'] * 0.6, \
+        f"Parallel execution should be significantly faster: {results_parallel['total_time']:.3f}s vs {results_sequential['total_time']:.3f}s"  # noqa: E501
+
+    # Batched execution should be faster than sequential but slower than fully parallel
+    assert results_batched['total_time'] < results_sequential['total_time'], \
+        "Batched execution should be faster than sequential"
+
+    # Verify the number of samples
+    assert len(results_parallel['start_times']) == 5, "Should have executed 5 samples"
+    assert len(results_sequential['start_times']) == 5, "Should have executed 5 samples"
+    assert len(results_batched['start_times']) == 5, "Should have executed 5 samples"
 
 def test_retry_exhaustion():
     """Test that retry exhaustion is properly reported."""

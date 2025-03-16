@@ -59,7 +59,7 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 marker = item.get_closest_marker("stochastic")
                 samples = marker.kwargs.get('samples', 10)
                 threshold = marker.kwargs.get('threshold', 0.5)
-                marker.kwargs.get('batch_size', None)
+                batch_size = marker.kwargs.get('batch_size', None)
                 retry_on = marker.kwargs.get('retry_on', None)
                 max_retries = marker.kwargs.get('max_retries', 3)
                 timeout = marker.kwargs.get('timeout', None)
@@ -69,13 +69,16 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
 
                 # Create a wrapper that will implement stochastic behavior
                 @pytest.mark.asyncio  # Keep the asyncio marker
-                async def stochastic_async_wrapper(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
+                async def stochastic_async_wrapper(*args, **kwargs) -> None:  # noqa: ANN002, ANN003, PLR0912
                     # Create stats tracker
                     stats = StochasticTestStats()
 
-                    # Run the test multiple times
-                    for i in range(samples):
-                        success = True
+                    # Validate inputs
+                    if samples <= 0:
+                        raise ValueError("samples must be a positive integer")
+
+                    # Create a helper to run a single test sample with retries
+                    async def run_single_test(i: int) -> tuple[bool, dict[str, object]]:
                         for attempt in range(max_retries):
                             try:
                                 # Run with timeout if specified
@@ -88,25 +91,78 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                                     await original_func(*args, **kwargs)
 
                                 # If we get here, test passed
-                                break
+                                return True
                             except Exception as e:
                                 # Check if we should retry
                                 if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:  # noqa: E501
                                     continue
 
                                 # Final failure
-                                success = False
-                                stats.failures.append({
+                                failure_info = {
                                     "error": str(e),
                                     "type": type(e).__name__,
                                     "context": {"run_index": i},
-                                })
-                                break
+                                }
+                                return False, failure_info
 
-                        # Update stats
-                        stats.total_runs += 1
-                        if success:
-                            stats.successful_runs += 1
+                        # If we get here, all retries were exhausted
+                        return False, {
+                            "error": f"Test failed after {max_retries} attempts",
+                            "type": "RetryError",
+                            "context": {"run_index": i},
+                        }
+
+                    # Create tasks for all samples
+                    tasks = [run_single_test(i) for i in range(samples)]
+
+                    # Normalize batch size (None or negative becomes "run all at once")
+                    effective_batch_size = None
+                    if batch_size and batch_size > 0:
+                        effective_batch_size = batch_size
+
+                    # Run tests with batching if specified, otherwise all at once
+                    if effective_batch_size:
+                        # Run in batches
+                        for i in range(0, len(tasks), effective_batch_size):
+                            batch = tasks[i:i + effective_batch_size]
+                            batch_results = await asyncio.gather(*batch, return_exceptions=True)
+
+                            # Process this batch's results
+                            for result in batch_results:
+                                stats.total_runs += 1
+                                if isinstance(result, Exception):
+                                    # Unexpected error
+                                    stats.failures.append({
+                                        "error": str(result),
+                                        "type": type(result).__name__,
+                                        "context": {"unexpected_error": True},
+                                    })
+                                elif result is True:
+                                    # Success
+                                    stats.successful_runs += 1
+                                else:
+                                    # Expected failure format (False, failure_info)
+                                    stats.failures.append(result[1])
+                    else:
+                        # Run all tests at once
+                        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                        # Process all results
+                        for result in all_results:
+                            stats.total_runs += 1
+                            if isinstance(result, Exception):
+                                # Unexpected error
+                                stats.failures.append({
+                                    "error": str(result),
+                                    "type": type(result).__name__,
+                                    "context": {"unexpected_error": True},
+                                })
+                            elif result is True:
+                                # Success
+                                stats.successful_runs += 1
+                            else:
+                                # Expected failure format (False, failure_info)
+                                stats.failures.append(result[1])
 
                     # Store results for reporting
                     _test_results[item.nodeid] = stats
