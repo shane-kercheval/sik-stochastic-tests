@@ -1,8 +1,11 @@
+"""Test multiple stochastic tests that use multiple fixtures in the same file."""
 from pathlib import Path
 import sys
 import subprocess
+import pytest
 
-def test_multiple_stochastic_with_fixtures(example_test_dir: Path):
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_multiple_stochastic_with_fixtures(example_test_dir: Path, is_async: bool):
     """Test running multiple stochastic tests that use fixtures in the same file."""
     # Create a counter file to track executions for each test
     test_one_counter = example_test_dir / "test_one_counter.txt"
@@ -11,10 +14,25 @@ def test_multiple_stochastic_with_fixtures(example_test_dir: Path):
     test_two_counter = example_test_dir / "test_two_counter.txt"
     test_two_counter.write_text("0")
 
+    # Configure based on async or sync
+    test_prefix = "async " if is_async else ""
+    asyncio_import = "import asyncio\n" if is_async else ""
+    sleep_code = "await asyncio.sleep(0.01)\n    " if is_async else ""
+
+    # Adding pytest.ini for asyncio_mode if testing async
+    if is_async:
+        pytest_ini = example_test_dir / "pytest.ini"
+        pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+asyncio_default_fixture_loop_scope = function
+""")
+
     # Create a test file with two stochastic tests that use different fixtures
     test_file = example_test_dir / "test_multiple_stochastic_fixtures.py"
-    test_file.write_text("""
+    test_file.write_text(f"""
 import pytest
+{asyncio_import}
 
 # Create a simple fixture that the first test uses
 @pytest.fixture
@@ -33,7 +51,8 @@ def unused_fixture():
 
 # First stochastic test uses fixture_one only
 @pytest.mark.stochastic(samples=3)
-def test_stochastic_one(fixture_one):
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_stochastic_one(fixture_one):
     # Track this execution
     with open("test_one_counter.txt", "r") as f:
         count = int(f.read())
@@ -41,11 +60,13 @@ def test_stochastic_one(fixture_one):
     with open("test_one_counter.txt", "w") as f:
         f.write(str(count + 1))
 
+    {sleep_code}
     assert fixture_one == "fixture_one_value"
 
 # Second stochastic test uses fixture_two only
 @pytest.mark.stochastic(samples=3)
-def test_stochastic_two(fixture_two):
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_stochastic_two(fixture_two):
     # Track this execution
     with open("test_two_counter.txt", "r") as f:
         count = int(f.read())
@@ -53,6 +74,7 @@ def test_stochastic_two(fixture_two):
     with open("test_two_counter.txt", "w") as f:
         f.write(str(count + 1))
 
+    {sleep_code}
     assert fixture_two == "fixture_two_value"
 """)
 
@@ -83,7 +105,8 @@ def test_stochastic_two(fixture_two):
     assert test_one_count == 3, f"Expected test_stochastic_one to run 3 times, but ran {test_one_count} times"  # noqa: E501
     assert test_two_count == 3, f"Expected test_stochastic_two to run 3 times, but ran {test_two_count} times"  # noqa: E501
 
-def test_stochastic_unexpected_kwargs(example_test_dir: Path):
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_stochastic_unexpected_kwargs(example_test_dir: Path, is_async: bool):
     """Test for unexpected keyword arguments issue with multiple stochastic tests and fixtures."""
     # Create counter files to track executions
     test_one_counter = example_test_dir / "test_one_counter.txt"
@@ -92,12 +115,26 @@ def test_stochastic_unexpected_kwargs(example_test_dir: Path):
     test_two_counter = example_test_dir / "test_two_counter.txt"
     test_two_counter.write_text("0")
 
+    # Configure based on async or sync
+    test_prefix = "async " if is_async else ""
+    asyncio_import = "import asyncio\n" if is_async else ""
+    sleep_code = "await asyncio.sleep(0.01)\n        " if is_async else ""
+
+    # Adding pytest.ini for asyncio_mode if testing async
+    if is_async:
+        pytest_ini = example_test_dir / "pytest.ini"
+        pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+asyncio_default_fixture_loop_scope = function
+""")
+
     # Create test file with fixtures that might cause unexpected keyword arguments
     test_file = example_test_dir / "test_unexpected_kwargs.py"
-    test_file.write_text("""
+    test_file.write_text(f"""
 import pytest
 import sys
-
+{asyncio_import}
 # Create two fixtures with the same parameterization setup
 @pytest.fixture
 def common_fixture():
@@ -112,7 +149,8 @@ def session_fixture():
 
 # First test with multiple fixtures
 @pytest.mark.stochastic(samples=2)
-def test_first_stochastic(common_fixture, session_fixture):
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_first_stochastic(common_fixture, session_fixture):
     # Track this execution
     with open("test_one_counter.txt", "r") as f:
         count = int(f.read())
@@ -120,14 +158,16 @@ def test_first_stochastic(common_fixture, session_fixture):
     with open("test_one_counter.txt", "w") as f:
         f.write(str(count + 1))
 
-    print(f"Test first stochastic execution {count+1}", file=sys.stderr)
+    {sleep_code}
+    print(f"Test first stochastic execution {{count+1}}", file=sys.stderr)
     assert common_fixture == "common_value"
     assert session_fixture == "session_value"
 
 # Second test uses the same fixtures but different parameter order
 # This can potentially cause unexpected kwargs if funcargs is not properly filtered
 @pytest.mark.stochastic(samples=2)
-def test_second_stochastic(session_fixture, common_fixture):
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_second_stochastic(session_fixture, common_fixture):
     # Track this execution
     with open("test_two_counter.txt", "r") as f:
         count = int(f.read())
@@ -135,7 +175,8 @@ def test_second_stochastic(session_fixture, common_fixture):
     with open("test_two_counter.txt", "w") as f:
         f.write(str(count + 1))
 
-    print(f"Test second stochastic execution {count+1}", file=sys.stderr)
+    {sleep_code}
+    print(f"Test second stochastic execution {{count+1}}", file=sys.stderr)
     assert session_fixture == "session_value"
     assert common_fixture == "common_value"
 """)
@@ -178,18 +219,33 @@ def test_second_stochastic(session_fixture, common_fixture):
     # Instead, we'll verify that at least the first test attempted to run
     assert test_one_count > 0, "First test didn't run at all"
 
-def test_stochastic_mixed_args(example_test_dir: Path):
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_stochastic_mixed_args(example_test_dir: Path, is_async: bool):
     """Test stochastic tests that use explicit args and **kwargs."""
     # Create counter files to track executions
     test_one_counter = example_test_dir / "mixed_counter.txt"
     test_one_counter.write_text("0")
 
+    # Configure based on async or sync
+    test_prefix = "async " if is_async else ""
+    asyncio_import = "import asyncio\n" if is_async else ""
+    sleep_code = "await asyncio.sleep(0.01)\n        " if is_async else ""
+
+    # Adding pytest.ini for asyncio_mode if testing async
+    if is_async:
+        pytest_ini = example_test_dir / "pytest.ini"
+        pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+asyncio_default_fixture_loop_scope = function
+""")
+
     # Create a test file with a mix of explicit and variable arguments
     test_file = example_test_dir / "test_mixed_args.py"
-    test_file.write_text("""
+    test_file.write_text(f"""
 import pytest
 import sys
-
+{asyncio_import}
 @pytest.fixture
 def fixture_a():
     return "fixture_a_value"
@@ -205,7 +261,8 @@ def fixture_c():
 # Test that uses a mix of explicit args and **kwargs
 # This can cause issues if the plugin doesn't correctly handle this pattern
 @pytest.mark.stochastic(samples=3)
-def test_with_mixed_args(fixture_a, **kwargs):
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_with_mixed_args(fixture_a, **kwargs):
     # Track this execution
     with open("mixed_counter.txt", "r") as f:
         count = int(f.read())
@@ -213,8 +270,9 @@ def test_with_mixed_args(fixture_a, **kwargs):
     with open("mixed_counter.txt", "w") as f:
         f.write(str(count + 1))
 
-    print(f"Test with mixed args execution {count+1}", file=sys.stderr)
-    print(f"kwargs: {kwargs}", file=sys.stderr)
+    {sleep_code}
+    print(f"Test with mixed args execution {{count+1}}", file=sys.stderr)
+    print(f"kwargs: {{kwargs}}", file=sys.stderr)
 
     assert fixture_a == "fixture_a_value"
     # We should get fixture_b and fixture_c in kwargs
@@ -252,27 +310,42 @@ def test_with_mixed_args(fixture_a, **kwargs):
     # Assert that the test at least attempted to run
     assert mixed_count > 0, "Mixed args test didn't run at all"
 
-def test_stochastic_dynamic_fixtures(example_test_dir: Path):
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_stochastic_dynamic_fixtures(example_test_dir: Path, is_async: bool):
     """Test stochastic tests with fixtures that use request and dynamically create other fixtures."""  # noqa: E501
     # Create counter files to track executions
     test_counter = example_test_dir / "dynamic_counter.txt"
     test_counter.write_text("0")
 
+    # Configure based on async or sync
+    test_prefix = "async " if is_async else ""
+    asyncio_import = "import asyncio\n" if is_async else ""
+    sleep_code = "await asyncio.sleep(0.01)\n    " if is_async else ""
+
+    # Adding pytest.ini for asyncio_mode if testing async
+    if is_async:
+        pytest_ini = example_test_dir / "pytest.ini"
+        pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+asyncio_default_fixture_loop_scope = function
+""")
+
     # Create a test file with complex fixture dependencies
     test_file = example_test_dir / "test_dynamic_fixtures.py"
-    test_file.write_text("""
+    test_file.write_text(f"""
 import pytest
 import sys
-
+{asyncio_import}
 # Dynamic fixture that can request other fixtures
 @pytest.fixture
 def dynamic_fixture(request):
     # Get the related fixture name from the request node
     test_name = request.node.name
-    print(f"Creating dynamic fixture for {test_name}", file=sys.stderr)
+    print(f"Creating dynamic fixture for {{test_name}}", file=sys.stderr)
 
     # Return a function that can be used by the test
-    return lambda x: f"Dynamic value for {test_name}: {x}"
+    return lambda x: f"Dynamic value for {{test_name}}: {{x}}"
 
 # Base fixture for reuse
 @pytest.fixture
@@ -281,7 +354,8 @@ def base_fixture():
 
 # First stochastic test uses dynamic fixture
 @pytest.mark.stochastic(samples=2)
-def test_with_dynamic_fixture(dynamic_fixture, base_fixture):
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_with_dynamic_fixture(dynamic_fixture, base_fixture):
     # Track this execution
     with open("dynamic_counter.txt", "r") as f:
         count = int(f.read())
@@ -289,27 +363,30 @@ def test_with_dynamic_fixture(dynamic_fixture, base_fixture):
     with open("dynamic_counter.txt", "w") as f:
         f.write(str(count + 1))
 
-    print(f"Dynamic test execution {count+1}", file=sys.stderr)
+    {sleep_code}
+    print(f"Dynamic test execution {{count+1}}", file=sys.stderr)
 
     # Use the dynamic fixture
     result = dynamic_fixture("test_param")
-    print(f"Dynamic fixture result: {result}", file=sys.stderr)
+    print(f"Dynamic fixture result: {{result}}", file=sys.stderr)
 
     assert "Dynamic value for" in result
     assert base_fixture == "base_value"
 
 # Second stochastic test also uses dynamic fixture but differently
 @pytest.mark.stochastic(samples=2)
-def test_with_dynamic_fixture_2(dynamic_fixture):
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_with_dynamic_fixture_2(dynamic_fixture):
     # Just reading counter
     with open("dynamic_counter.txt", "r") as f:
         count = int(f.read())
 
-    print(f"Second dynamic test, count is {count}", file=sys.stderr)
+    {sleep_code}
+    print(f"Second dynamic test, count is {{count}}", file=sys.stderr)
 
     # Use the dynamic fixture differently
     result = dynamic_fixture("another_param")
-    print(f"Dynamic fixture result 2: {result}", file=sys.stderr)
+    print(f"Dynamic fixture result 2: {{result}}", file=sys.stderr)
 
     assert "Dynamic value for" in result
     assert "another_param" in result
@@ -344,18 +421,33 @@ def test_with_dynamic_fixture_2(dynamic_fixture):
     # The first test should have run twice
     assert run_count == 2, f"Expected test_with_dynamic_fixture to run 2 times, but ran {run_count} times"  # noqa: E501
 
-def test_stochastic_class_fixtures(example_test_dir: Path):
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_stochastic_class_fixtures(example_test_dir: Path, is_async: bool):
     """Test stochastic tests defined as class methods with fixtures."""
     # Create counter files to track executions
     test_one_counter = example_test_dir / "class_method_counter.txt"
     test_one_counter.write_text("0")
 
+    # Configure based on async or sync
+    test_prefix = "async " if is_async else ""
+    asyncio_import = "import asyncio\n" if is_async else ""
+    sleep_code = "await asyncio.sleep(0.01)\n        " if is_async else ""
+
+    # Adding pytest.ini for asyncio_mode if testing async
+    if is_async:
+        pytest_ini = example_test_dir / "pytest.ini"
+        pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+asyncio_default_fixture_loop_scope = function
+""")
+
     # Create a test file with stochastic tests in a class with fixtures
     test_file = example_test_dir / "test_class_methods.py"
-    test_file.write_text("""
+    test_file.write_text(f"""
 import pytest
 import sys
-
+{asyncio_import}
 # Create some fixtures
 @pytest.fixture
 def fixture_a():
@@ -366,11 +458,12 @@ def fixture_b():
     return "fixture_b_value"
 
 # Class with stochastic test methods
+{"@pytest.mark.asyncio" if is_async else ""}
 class TestStochasticClassMethods:
 
     # Method that uses fixture_a
     @pytest.mark.stochastic(samples=2)
-    def test_method_one(self, fixture_a):
+    {test_prefix}def test_method_one(self, fixture_a):
         # Track this execution
         with open("class_method_counter.txt", "r") as f:
             count = int(f.read())
@@ -378,17 +471,19 @@ class TestStochasticClassMethods:
         with open("class_method_counter.txt", "w") as f:
             f.write(str(count + 1))
 
-        print(f"Test method one execution {count+1}", file=sys.stderr)
+        {sleep_code}
+        print(f"Test method one execution {{count+1}}", file=sys.stderr)
         assert fixture_a == "fixture_a_value"
 
     # Method that uses fixture_b
     @pytest.mark.stochastic(samples=2)
-    def test_method_two(self, fixture_b):
+    {test_prefix}def test_method_two(self, fixture_b):
         # Track execution but don't update counter
         with open("class_method_counter.txt", "r") as f:
             count = int(f.read())
 
-        print(f"Test method two execution, count is {count}", file=sys.stderr)
+        {sleep_code}
+        print(f"Test method two execution, count is {{count}}", file=sys.stderr)
         assert fixture_b == "fixture_b_value"
 """)
 
