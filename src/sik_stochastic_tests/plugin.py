@@ -120,14 +120,14 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 original_func = item.obj
 
                 # Create a wrapper that will implement stochastic behavior for async tests
-                # 
+                #
                 # IMPORTANT: The interaction between pytest-asyncio and our plugin requires
-                # special handling of function signatures. 
+                # special handling of function signatures.
                 #
                 # When pytest-asyncio processes an async test:
                 # 1. It wraps the original function with pytest_asyncio.plugin.wrap_in_sync()
                 # 2. It calls this wrapped function with the exact fixture values it collected
-                # 3. If the test has **kwargs parameters, pytest-asyncio needs to pass them correctly
+                # 3. If the test has **kwargs parameters, pytest-asyncio needs to pass them correctly  # noqa: E501
                 #
                 # Our stochastic wrapper must therefore:
                 # 1. Preserve the EXACT parameter signature of the original test function
@@ -135,13 +135,25 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 # 3. Handle special cases like *args and **kwargs correctly
                 #
                 # If we don't do this, we get errors like:
-                # "TypeError: missing required positional argument 'kwargs'" 
+                # "TypeError: missing required positional argument 'kwargs'"
                 # This happens because pytest-asyncio sees 'kwargs' as a positional parameter
-                # instead of a variable keyword parameter (**kwargs) if we don't preserve the signature.
+                # instead of a variable keyword parameter (**kwargs) if we don't preserve the signature.  # noqa: E501
+                #
+                # WHY DYNAMIC CODE GENERATION:
+                # We use dynamic code generation (exec) for several critical reasons:
+                #   1. To create a wrapper with the EXACT same parameter signature as the original function  # noqa: E501
+                #   2. To support arbitrary parameter structures including *args and **kwargs
+                #   3. To satisfy pytest-asyncio's expectations for function signatures
+                #   4. To handle fixtures correctly, which requires specific parameter names
+                #
+                # Alternative approaches like using a generic **kwargs parameter would break
+                # pytest's fixture injection mechanism and create subtle parameter binding issues.
+                # While dynamic code generation adds complexity, it's the most robust way to
+                # handle the variety of function signatures we might encounter.
                 sig = inspect.signature(original_func)
-                
+
                 # Create a parameter string that exactly matches the original function's signature.
-                # This is CRITICAL for proper fixture injection and interaction with pytest-asyncio.
+                # This is CRITICAL for proper fixture injection and interaction with pytest-asyncio.  # noqa: E501
                 # We must handle each parameter kind differently:
                 # - POSITIONAL_ONLY: rare in Python but needs special handling
                 # - POSITIONAL_OR_KEYWORD: regular parameters like "request" or "fixture_name"
@@ -150,7 +162,7 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 # - VAR_KEYWORD: **kwargs parameters that collect extra keyword arguments
                 param_list = []
                 for name, param in sig.parameters.items():
-                    if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                    if param.kind == inspect.Parameter.POSITIONAL_ONLY:  # noqa: SIM114
                         param_list.append(f"{name}")
                     elif param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
                         param_list.append(f"{name}")
@@ -160,9 +172,9 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                         param_list.append(f"*{name}")
                     elif param.kind == inspect.Parameter.VAR_KEYWORD:
                         param_list.append(f"**{name}")
-                
+
                 param_str = ", ".join(param_list)
-                
+
                 # When we call the original function from inside our wrapper, we need to
                 # forward all parameters exactly as they were received. This is especially
                 # important for *args and **kwargs parameters.
@@ -181,15 +193,15 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                         # For all other parameters, we pass them as keyword arguments
                         # to ensure they're correctly passed regardless of order
                         param_forwarding.append(f"{name}={name}")
-                
+
                 param_passing = ", ".join(param_forwarding)
-                
+
                 # The exec_context provides all the variables that will be accessible
                 # inside our dynamically created wrapper function.
-                # 
+                #
                 # IMPORTANT: The module-level _test_results dictionary must be included
                 # for the wrapper to store test results that will be reported at the end.
-                exec_context = {'pytest': pytest, 
+                exec_context = {'pytest': pytest,
                                'original_func': original_func,
                                'samples': samples,
                                'threshold': threshold,
@@ -206,7 +218,12 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
 
                 # Define the wrapper function with our dynamically created parameter signature.
                 # We use exec() to create a function with the exact parameter structure we need.
-                # 
+                #
+                # IMPORTANT: This dynamic code generation approach is a deliberate design choice.
+                # We're generating a string containing Python code that defines a function with
+                # the exact parameter signature we need, then executing that code with exec().
+                # This gives us maximum flexibility to handle any parameter structure.
+                #
                 # The @pytest.mark.asyncio decorator is critical - it signals to pytest-asyncio
                 # that this is an async function that needs special handling. Without this marker,
                 # pytest-asyncio would not know to handle this as an async test.
@@ -232,7 +249,7 @@ async def stochastic_async_wrapper({param_str}):
                         # IMPORTANT: We pass parameters EXACTLY as they were received
                         # This is vital for proper handling of fixtures and special parameter types
                         test_coro = original_func({param_passing})
-                        
+
                         # asyncio.wait_for cancels the task if it exceeds the timeout
                         await asyncio.wait_for(test_coro, timeout)
                     except TimeoutError:
@@ -283,7 +300,7 @@ async def stochastic_async_wrapper({param_str}):
         # exhaustion for tests that use significant resources (network, CPU, etc.)
         for i in range(0, len(tasks), effective_batch_size):
             batch = tasks[i:i + effective_batch_size]
-            
+
             # asyncio.gather runs all tasks concurrently and waits for all to complete
             # return_exceptions=True ensures we get results even if some tasks fail
             batch_results = await asyncio.gather(*batch, return_exceptions=True)
@@ -340,13 +357,13 @@ async def stochastic_async_wrapper({param_str}):
             ("..." if len(stats.failures) > 5 else "")
         )
         raise AssertionError(message)
-"""
+"""  # noqa: E501
                 # Execute our dynamically created wrapper function code in a controlled namespace
                 # This creates the actual function object with the exact signature we need
                 local_ns = {}
                 exec(wrapper_code, exec_context, local_ns)
                 stochastic_async_wrapper = local_ns['stochastic_async_wrapper']
-                
+
                 # Copy metadata from original function to wrapper
                 # This is CRITICAL for pytest to correctly identify and report the test.
                 # Without these attributes, pytest wouldn't display the correct test name
@@ -355,7 +372,7 @@ async def stochastic_async_wrapper({param_str}):
                 stochastic_async_wrapper.__module__ = original_func.__module__
                 if hasattr(original_func, '__qualname__'):
                     stochastic_async_wrapper.__qualname__ = original_func.__qualname__
-                
+
                 # The signature is vitally important for fixture resolution
                 # pytest-asyncio uses this to determine which fixtures to inject
                 # Without this, fixtures would not be correctly passed to our wrapper
@@ -664,17 +681,17 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
                     # Filter arguments to only pass those the function accepts
                     sig = inspect.signature(testfunction)
                     actual_argnames = set(sig.parameters.keys())
-                    filtered_args = {name: arg for name, arg in run_args.items() if name in actual_argnames}
-                    
+                    filtered_args = {name: arg for name, arg in run_args.items() if name in actual_argnames}  # noqa: E501
+
                     await asyncio.wait_for(testfunction(**filtered_args), timeout=timeout)
                 except TimeoutError:
                     raise TimeoutError(f"Test timed out after {timeout} seconds")
             else:
                 # Filter arguments to only pass those the function accepts
                 sig = inspect.signature(testfunction)
-                actual_argnames = set(sig.parameters.keys()) 
-                filtered_args = {name: arg for name, arg in run_args.items() if name in actual_argnames}
-                
+                actual_argnames = set(sig.parameters.keys())
+                filtered_args = {name: arg for name, arg in run_args.items() if name in actual_argnames}  # noqa: E501
+
                 await testfunction(**filtered_args)
 
             return True, None
