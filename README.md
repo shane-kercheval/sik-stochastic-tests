@@ -1,5 +1,7 @@
 # sik-stochastic-tests
 
+[This package was written mostly by Claude Code via Sonnet 3.7]
+
 A pytest plugin for testing non-deterministic systems such as LLMs, running tests multiple times with configurable sample sizes and success thresholds to establish reliable results despite occasional random failures.
 
 ## Overview
