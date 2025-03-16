@@ -120,118 +120,229 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 original_func = item.obj
 
                 # Create a wrapper that will implement stochastic behavior for async tests
-                @pytest.mark.asyncio  # Keep the asyncio marker to ensure pytest-asyncio handles it
-                async def stochastic_async_wrapper(*args, **kwargs) -> None:  # noqa: ANN002, ANN003, PLR0912
-                    # Create stats tracker for this test run
-                    stats = StochasticTestStats()
+                # 1. Maintain the original function signature
+                sig = inspect.signature(original_func)
+                
+                # Create a wrapper using the exact same parameter specification 
+                # This is key to ensuring fixtures are properly injected
+                print(f"DEBUG - Creating wrapper for {original_func.__name__} with signature {sig}")
+                print(f"DEBUG - Original function: {original_func}")
+                print(f"DEBUG - Parameters: {list(sig.parameters.keys())}")
+                print(f"DEBUG - Parameter kinds: {[(name, param.kind) for name, param in sig.parameters.items()]}")
+                print(f"DEBUG - Item.funcargs: {getattr(item, 'funcargs', 'No funcargs')}")
+                
+                # We need to preserve the EXACT parameter structure of the original function
+                # including VAR_POSITIONAL (*args) and VAR_KEYWORD (**kwargs) parameters
+                param_list = []
+                for name, param in sig.parameters.items():
+                    if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                        param_list.append(f"{name}")
+                    elif param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                        param_list.append(f"{name}")
+                    elif param.kind == inspect.Parameter.KEYWORD_ONLY:
+                        param_list.append(f"*, {name}")
+                    elif param.kind == inspect.Parameter.VAR_POSITIONAL:
+                        param_list.append(f"*{name}")
+                    elif param.kind == inspect.Parameter.VAR_KEYWORD:
+                        param_list.append(f"**{name}")
+                
+                param_str = ", ".join(param_list)
+                print(f"DEBUG - Generated param string: {param_str}")
+                
+                # Build code to reconstruct the params dict for passing to the original function
+                param_reconstruction = []
+                has_var_positional = False
+                var_positional_name = ""
+                has_var_keyword = False
+                var_keyword_name = ""
+                
+                for name, param in sig.parameters.items():
+                    if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                        has_var_positional = True
+                        var_positional_name = name
+                    elif param.kind == inspect.Parameter.VAR_KEYWORD:
+                        has_var_keyword = True
+                        var_keyword_name = name
+                
+                # This is the key part that preserves the original function signature
+                exec_context = {'pytest': pytest, 
+                               'original_func': original_func,
+                               'samples': samples,
+                               'threshold': threshold,
+                               'batch_size': batch_size,
+                               'retry_on': retry_on,
+                               'max_retries': max_retries,
+                               'timeout': timeout,
+                               'asyncio': asyncio,
+                               'StochasticTestStats': StochasticTestStats,
+                               'TimeoutError': TimeoutError,
+                               'Exception': Exception,
+                               'inspect': inspect,
+                               '_test_results': _test_results,  # Add this here
+                               'item_nodeid': item.nodeid}
 
-                    # Validate inputs to prevent common issues
-                    if samples <= 0:
-                        raise ValueError("samples must be a positive integer")
-
-                    # Helper function to run a single test sample with retry logic
-                    # Returns (True) for success or (False, failure_info) for failures
-                    async def run_single_test(i: int) -> tuple[bool, dict[str, object]]:
-                        for attempt in range(max_retries):
-                            try:
-                                # Apply timeout if specified to prevent tests from hanging
-                                if timeout is not None:
-                                    try:
-                                        # asyncio.wait_for cancels the task if it exceeds the timeout  # noqa: E501
-                                        await asyncio.wait_for(original_func(*args, **kwargs), timeout)  # noqa: E501
-                                    except TimeoutError:
-                                        raise TimeoutError(f"Test timed out after {timeout} seconds")  # noqa: E501
-                                else:
-                                    await original_func(*args, **kwargs)
-
-                                # If we get here without an exception, the test passed
-                                return True
-                            except Exception as e:
-                                # Check if this exception should trigger a retry
-                                if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:  # noqa: E501
-                                    # Continue to the next retry attempt
-                                    continue
-
-                                # If we're not retrying, record the failure details
-                                failure_info = {
-                                    "error": str(e),
-                                    "type": type(e).__name__,
-                                    "context": {"run_index": i},
-                                }
-                                return False, failure_info
-
-                        # This executes if all retry attempts were exhausted
-                        return False, {
-                            "error": f"Test failed after {max_retries} attempts",
-                            "type": "RetryError",
-                            "context": {"run_index": i},
-                        }
-
-                    # Create tasks for all samples
-                    tasks = [run_single_test(i) for i in range(samples)]
-
-                    # Normalize batch size
-                    effective_batch_size = None
-                    if batch_size and batch_size > 0:
-                        effective_batch_size = batch_size
-
-                    # Run tests with batching if specified, otherwise all at once
-                    if effective_batch_size:
-                        # Run in batches to limit concurrency
-                        for i in range(0, len(tasks), effective_batch_size):
-                            batch = tasks[i:i + effective_batch_size]
-                            batch_results = await asyncio.gather(*batch, return_exceptions=True)
-
-                            # Process results
-                            for result in batch_results:
-                                stats.total_runs += 1
-                                if isinstance(result, Exception):
-                                    stats.failures.append({
-                                        "error": str(result),
-                                        "type": type(result).__name__,
-                                        "context": {"unexpected_error": True},
-                                    })
-                                elif result is True:
-                                    stats.successful_runs += 1
-                                else:
-                                    stats.failures.append(result[1])
+                # Construct param_passing code for calling the original function
+                param_passing = ""
+                if has_var_positional and has_var_keyword:
+                    # Function has both *args and **kwargs
+                    regular_params = [name for name, param in sig.parameters.items() 
+                                     if param.kind not in (inspect.Parameter.VAR_POSITIONAL, 
+                                                          inspect.Parameter.VAR_KEYWORD)]
+                    param_passing = ", ".join([f"{name}={name}" for name in regular_params])
+                    if param_passing:
+                        param_passing += f", *{var_positional_name}, **{var_keyword_name}"
                     else:
-                        # Run all tests at once
-                        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+                        param_passing = f"*{var_positional_name}, **{var_keyword_name}"
+                elif has_var_keyword:
+                    # Function has **kwargs only
+                    regular_params = [name for name, param in sig.parameters.items() 
+                                     if param.kind != inspect.Parameter.VAR_KEYWORD]
+                    param_passing = ", ".join([f"{name}={name}" for name in regular_params])
+                    if param_passing:
+                        param_passing += f", **{var_keyword_name}"
+                    else:
+                        param_passing = f"**{var_keyword_name}"
+                elif has_var_positional:
+                    # Function has *args only
+                    regular_params = [name for name, param in sig.parameters.items() 
+                                     if param.kind != inspect.Parameter.VAR_POSITIONAL]
+                    param_passing = ", ".join([f"{name}={name}" for name in regular_params])
+                    if param_passing:
+                        param_passing += f", *{var_positional_name}"
+                    else:
+                        param_passing = f"*{var_positional_name}"
+                else:
+                    # Function has only regular parameters
+                    param_passing = ", ".join([f"{name}={name}" for name in sig.parameters.keys()])
+                
+                print(f"DEBUG - Parameter passing code: {param_passing}")
 
-                        # Process results
-                        for result in all_results:
-                            stats.total_runs += 1
-                            if isinstance(result, Exception):
-                                stats.failures.append({
-                                    "error": str(result),
-                                    "type": type(result).__name__,
-                                    "context": {"unexpected_error": True},
-                                })
-                            elif result is True:
-                                stats.successful_runs += 1
-                            else:
-                                stats.failures.append(result[1])
+                # Define the wrapper function preserving parameter names
+                wrapper_code = f"""
+@pytest.mark.asyncio
+async def stochastic_async_wrapper({param_str}):
+    print(f"DEBUG - stochastic_async_wrapper called with params types: {{[type(val).__name__ for key, val in locals().items() if key in {list(sig.parameters.keys())}]}}")
+    # Create stats tracker for this test run
+    stats = StochasticTestStats()
 
-                    # Store test results for final reporting
-                    _test_results[item.nodeid] = stats
+    # Validate inputs to prevent common issues
+    if samples <= 0:
+        raise ValueError("samples must be a positive integer")
 
-                    # Fail the test if success rate is below threshold
-                    if stats.success_rate < threshold:
-                        message = (
-                            f"Stochastic test failed: success rate {stats.success_rate:.2f} below threshold {threshold}\n"  # noqa: E501
-                            f"Ran {stats.total_runs} times, {stats.successful_runs} successes, {len(stats.failures)} failures\n"  # noqa: E501
-                            f"Failure details: {stats.failures[:5]}" +
-                            ("..." if len(stats.failures) > 5 else "")
-                        )
-                        raise AssertionError(message)
+    # Helper function to run a single test sample with retry logic
+    async def run_single_test(i: int):
+        for attempt in range(max_retries):
+            try:
+                # Apply timeout if specified to prevent tests from hanging
+                if timeout is not None:
+                    try:
+                        # asyncio.wait_for cancels the task if it exceeds the timeout
+                        # Pass parameters directly with the exact same structure as received
+                        test_coro = original_func({param_passing})
+                        await asyncio.wait_for(test_coro, timeout)
+                    except TimeoutError:
+                        raise TimeoutError(f"Test timed out after {{timeout}} seconds")
+                else:
+                    # Run the test with the exact parameters we received
+                    print(f"DEBUG - Running original_func with {param_passing}")
+                    await original_func({param_passing})
 
+                # If we get here without an exception, the test passed
+                return True
+            except Exception as e:
+                # Check if this exception should trigger a retry
+                if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:
+                    # Continue to the next retry attempt
+                    continue
+
+                # If we're not retrying, record the failure details
+                failure_info = {{
+                    "error": str(e),
+                    "type": type(e).__name__,
+                    "context": {{"run_index": i}},
+                }}
+                return False, failure_info
+
+        # This executes if all retry attempts were exhausted
+        return False, {{
+            "error": f"Test failed after {{max_retries}} attempts",
+            "type": "RetryError",
+            "context": {{"run_index": i}},
+        }}
+
+    # Create tasks for all samples
+    tasks = [run_single_test(i) for i in range(samples)]
+
+    # Normalize batch size
+    effective_batch_size = None
+    if batch_size and batch_size > 0:
+        effective_batch_size = batch_size
+
+    # Run tests with batching if specified, otherwise all at once
+    if effective_batch_size:
+        # Run in batches to limit concurrency
+        for i in range(0, len(tasks), effective_batch_size):
+            batch = tasks[i:i + effective_batch_size]
+            batch_results = await asyncio.gather(*batch, return_exceptions=True)
+
+            # Process results
+            for result in batch_results:
+                stats.total_runs += 1
+                if isinstance(result, Exception):
+                    stats.failures.append({{
+                        "error": str(result),
+                        "type": type(result).__name__,
+                        "context": {{"unexpected_error": True}},
+                    }})
+                elif result is True:
+                    stats.successful_runs += 1
+                else:
+                    stats.failures.append(result[1])
+    else:
+        # Run all tests at once
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        for result in all_results:
+            stats.total_runs += 1
+            if isinstance(result, Exception):
+                stats.failures.append({{
+                    "error": str(result),
+                    "type": type(result).__name__,
+                    "context": {{"unexpected_error": True}},
+                }})
+            elif result is True:
+                stats.successful_runs += 1
+            else:
+                stats.failures.append(result[1])
+
+    # Store test results for final reporting
+    _test_results[item_nodeid] = stats
+
+    # Fail the test if success rate is below threshold
+    if stats.success_rate < threshold:
+        message = (
+            f"Stochastic test failed: success rate {{stats.success_rate:.2f}} below threshold {{threshold}}\\n"
+            f"Ran {{stats.total_runs}} times, {{stats.successful_runs}} successes, {{len(stats.failures)}} failures\\n"
+            f"Failure details: {{stats.failures[:5]}}" +
+            ("..." if len(stats.failures) > 5 else "")
+        )
+        raise AssertionError(message)
+"""
+                # Create the wrapper function in a controlled namespace
+                local_ns = {}
+                exec(wrapper_code, exec_context, local_ns)
+                stochastic_async_wrapper = local_ns['stochastic_async_wrapper']
+                
                 # Copy metadata from original function to wrapper to preserve
                 # important attributes like name and module for pytest reporting
                 stochastic_async_wrapper.__name__ = original_func.__name__
                 stochastic_async_wrapper.__module__ = original_func.__module__
                 if hasattr(original_func, '__qualname__'):
                     stochastic_async_wrapper.__qualname__ = original_func.__qualname__
+                
+                # Make sure we carry the required fixtures information
+                stochastic_async_wrapper.__signature__ = sig
 
                 # Replace the original test function with our wrapper
                 item.obj = stochastic_async_wrapper
@@ -531,11 +642,21 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
 
             if timeout is not None:
                 try:
-                    await asyncio.wait_for(testfunction(**run_args), timeout=timeout)
+                    # Filter arguments to only pass those the function accepts
+                    sig = inspect.signature(testfunction)
+                    actual_argnames = set(sig.parameters.keys())
+                    filtered_args = {name: arg for name, arg in run_args.items() if name in actual_argnames}
+                    
+                    await asyncio.wait_for(testfunction(**filtered_args), timeout=timeout)
                 except TimeoutError:
                     raise TimeoutError(f"Test timed out after {timeout} seconds")
             else:
-                await testfunction(**run_args)
+                # Filter arguments to only pass those the function accepts
+                sig = inspect.signature(testfunction)
+                actual_argnames = set(sig.parameters.keys()) 
+                filtered_args = {name: arg for name, arg in run_args.items() if name in actual_argnames}
+                
+                await testfunction(**filtered_args)
 
             return True, None
         except Exception as e:
