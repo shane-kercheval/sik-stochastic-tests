@@ -475,8 +475,27 @@ def _run_stochastic_tests_in_thread(
     """
     Run stochastic tests in a dedicated thread with its own event loop.
 
-    This prevents interference with pytest-asyncio's event loop, fixing issues
-    with 'pop from an empty deque' errors and event loop cleanup.
+    RACE CONDITION EXPLANATION:
+    We encountered a race condition in asyncio where multiple async generators
+    being cleaned up simultaneously across different contexts would sometimes
+    cause the event loop's _ready deque to become empty unexpectedly, resulting
+    in an "IndexError: pop from an empty deque" error. This occurred primarily
+    with async tests that use external libraries like OpenAI, httpx, or httpcore,
+    which rely heavily on async generators for streaming responses.
+
+    WHY THREAD ISOLATION HELPS:
+    In Python, each thread can have its own event loop. By running each stochastic
+    test session in a dedicated thread with its own isolated event loop, we prevent
+    interference between pytest-asyncio's event loop management and our concurrent
+    test executions. This isolation eliminates the race condition by ensuring that
+    async generator cleanup operations don't interfere with each other across
+    different execution contexts.
+
+    IMPLEMENTATION DETAILS:
+    1. We create a dedicated thread for running the test samples
+    2. This thread gets its own event loop with a custom exception handler
+    3. Test results are safely passed back to the main thread through a queue
+    4. The thread's event loop is properly closed and dereferenced when done
 
     Args:
         testfunction: The test function to execute
@@ -495,7 +514,22 @@ def _run_stochastic_tests_in_thread(
     result_queue = queue.Queue()
 
     def thread_worker() -> None:
-        """Run all stochastic test samples in an isolated thread with its own event loop."""
+        """
+        Run all stochastic test samples in an isolated thread with its own event loop.
+        
+        This function is the core of our thread isolation strategy:
+        
+        1. It creates a new, isolated event loop for this thread only
+        2. Sets up a custom exception handler that specifically ignores the
+           "pop from an empty deque" IndexError that can occur during async cleanup
+        3. Runs all test samples in this isolated environment
+        4. Properly cleans up the event loop to prevent resource leaks
+        5. Returns results safely to the main thread via a queue
+        
+        This approach resolves the race condition that occurs when async generators
+        from packages like httpx/httpcore (used by OpenAI, Anthropic clients) are
+        being cleaned up concurrently in the same event loop.
+        """
         try:
             # Create a new event loop specific to this thread
             thread_loop = asyncio.new_event_loop()
@@ -512,10 +546,6 @@ def _run_stochastic_tests_in_thread(
 
             thread_loop.set_exception_handler(custom_exception_handler)
 
-            # Create a dummy task to ensure the loop queue is never empty
-            async def dummy() -> None:
-                await asyncio.sleep(0)
-            thread_loop.create_task(dummy())  # noqa: RUF006
 
             try:
                 # Run all test samples in this thread's event loop
@@ -608,7 +638,16 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     funcargs = {name: arg for name, arg in pyfuncitem.funcargs.items() if name in actual_argnames}
 
     # Run stochastic tests in a separate thread with its own event loop
-    # This isolates our tests from pytest-asyncio's event loop, fixing the "pop from empty deque" error  # noqa: E501
+    # This isolates our tests from pytest-asyncio's event loop, fixing the "pop from empty deque" error
+    # 
+    # IMPORTANT: This thread-based approach is critical for preventing race conditions
+    # during async generator cleanup. By isolating each stochastic test run in its own
+    # thread with a dedicated event loop, we prevent interference with pytest-asyncio's 
+    # event loop and avoid the "pop from empty deque" error that can occur when multiple
+    # async generators are being cleaned up simultaneously in shared execution contexts.
+    #
+    # This is particularly important for tests that use the OpenAI API, httpx, or other
+    # libraries that rely heavily on async generators for streaming responses.
     _run_stochastic_tests_in_thread(
         testfunction=testfunction,
         funcargs=funcargs,
