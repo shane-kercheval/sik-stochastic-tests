@@ -110,7 +110,7 @@ wheels = [
 
 [[package]]
 name = "sik-stochastic-tests"
-version = "0.0.9"
+version = "0.0.11"
 source = { editable = "." }
 dependencies = [
     { name = "pytest" },
