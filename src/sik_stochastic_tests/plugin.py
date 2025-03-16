@@ -1,15 +1,36 @@
-"""Pytest plugin for running stochastic tests."""
+"""
+Pytest plugin for running stochastic tests.
+
+This plugin enables tests to be run multiple times to verify their statistical properties.
+It's useful for testing code with inherent randomness or non-deterministic behavior
+(e.g., ML models, API calls with variable responses, race conditions).
+
+Key features:
+- Run tests multiple times and report aggregate statistics
+- Set success thresholds for flaky tests
+- Concurrent execution for speed with configurable batch sizes
+- Automatic retry on specified exceptions
+- Support for both synchronous and asynchronous tests
+- Configurable timeouts per test
+"""
 import pytest
 import asyncio
 import inspect
 from dataclasses import dataclass, field
 
-# Store test results for reporting
+# Global dictionary to store test results for reporting at the end of the test session
+# Key: test nodeid, Value: statistics for that test
 _test_results = {}
 
 @dataclass
 class StochasticTestStats:
-    """Statistics for a stochastic test."""
+    """
+    Statistics tracker for stochastic test runs.
+
+    This class collects metrics about test runs including total attempts,
+    successful runs, and detailed failure information to help diagnose
+    issues with non-deterministic tests.
+    """
 
     total_runs: int = 0
     successful_runs: int = 0
@@ -17,11 +38,22 @@ class StochasticTestStats:
 
     @property
     def success_rate(self) -> float:
-        """Calculate the success rate of the test."""
+        """
+        Calculate the success rate of the test.
+
+        Returns:
+            The proportion of successful runs (0.0 to 1.0).
+            Returns 0.0 if no tests have been run yet.
+        """
         return self.successful_runs / self.total_runs if self.total_runs > 0 else 0.0
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register custom markers with pytest."""
+    """
+    Register the stochastic marker with pytest.
+
+    This hook is called during pytest startup to register the custom marker
+    so it can be used in test files without generating warnings.
+    """
     config.addinivalue_line(
         "markers",
         "stochastic(samples, threshold, batch_size, retry_on, max_retries, timeout): "
@@ -30,32 +62,52 @@ def pytest_configure(config: pytest.Config) -> None:
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_generate_tests(metafunc):  # noqa
-    """Modify test collection to intercept async stochastic tests."""
+    """
+    Hook for test collection phase.
+
+    This is a placeholder hook that could be used for future parametrization needs.
+    Currently, we only use the yield to ensure execution order.
+    """
     yield
     # This hook runs after test generation, allowing us to modify how tests will be executed
 
 def pytest_make_collect_report(collector):  # noqa
-    """Hook that runs after collection is complete but before tests are executed."""
+    """
+    Hook that runs after collection is complete but before tests are executed.
+
+    This is a placeholder for potential collection modifications.
+    """
     # We can use this to intercept collected tests and modify them
     return
 
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
-    """Modify collected items to handle async stochastic tests."""
-    # Skip modification if stochastic mode is disabled
+    """
+    Modify collected test items to handle async stochastic tests.
+
+    This hook intercepts async test functions marked with @stochastic and
+    wraps them with our concurrent execution logic. We use trylast to ensure
+    we run after other hooks that might modify the test collection.
+
+    Args:
+        session: The pytest session
+        config: The pytest config object
+        items: List of collected test items to be modified
+    """
+    # Skip modification if stochastic mode is disabled via the command line
     if config.getoption("--disable-stochastic", False):
         return
 
-    # This runs after all tests are collected
+    # Process each collected test item
     for item in items:
-        # Check if this is a stochastic test and if it's async
+        # Check if this is a stochastic test with the required attributes
         if (hasattr(item, 'get_closest_marker') and  # noqa: SIM102
                 item.get_closest_marker('stochastic') and
                 hasattr(item, 'obj')):
 
-            # Only modify async tests
+            # We handle async tests differently because they need special execution within the event loop  # noqa: E501
             if has_asyncio_marker(item):
-                # Get stochastic parameters
+                # Get stochastic parameters from the marker - use sensible defaults if not specified  # noqa: E501
                 marker = item.get_closest_marker("stochastic")
                 samples = marker.kwargs.get('samples', 10)
                 threshold = marker.kwargs.get('threshold', 0.5)
@@ -64,40 +116,43 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 max_retries = marker.kwargs.get('max_retries', 3)
                 timeout = marker.kwargs.get('timeout', None)
 
-                # Get the original test function
+                # Store the original test function that we'll wrap
                 original_func = item.obj
 
-                # Create a wrapper that will implement stochastic behavior
-                @pytest.mark.asyncio  # Keep the asyncio marker
+                # Create a wrapper that will implement stochastic behavior for async tests
+                @pytest.mark.asyncio  # Keep the asyncio marker to ensure pytest-asyncio handles it
                 async def stochastic_async_wrapper(*args, **kwargs) -> None:  # noqa: ANN002, ANN003, PLR0912
-                    # Create stats tracker
+                    # Create stats tracker for this test run
                     stats = StochasticTestStats()
 
-                    # Validate inputs
+                    # Validate inputs to prevent common issues
                     if samples <= 0:
                         raise ValueError("samples must be a positive integer")
 
-                    # Create a helper to run a single test sample with retries
+                    # Helper function to run a single test sample with retry logic
+                    # Returns (True) for success or (False, failure_info) for failures
                     async def run_single_test(i: int) -> tuple[bool, dict[str, object]]:
                         for attempt in range(max_retries):
                             try:
-                                # Run with timeout if specified
+                                # Apply timeout if specified to prevent tests from hanging
                                 if timeout is not None:
                                     try:
+                                        # asyncio.wait_for cancels the task if it exceeds the timeout  # noqa: E501
                                         await asyncio.wait_for(original_func(*args, **kwargs), timeout)  # noqa: E501
                                     except TimeoutError:
                                         raise TimeoutError(f"Test timed out after {timeout} seconds")  # noqa: E501
                                 else:
                                     await original_func(*args, **kwargs)
 
-                                # If we get here, test passed
+                                # If we get here without an exception, the test passed
                                 return True
                             except Exception as e:
-                                # Check if we should retry
+                                # Check if this exception should trigger a retry
                                 if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:  # noqa: E501
+                                    # Continue to the next retry attempt
                                     continue
 
-                                # Final failure
+                                # If we're not retrying, record the failure details
                                 failure_info = {
                                     "error": str(e),
                                     "type": type(e).__name__,
@@ -105,7 +160,7 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                                 }
                                 return False, failure_info
 
-                        # If we get here, all retries were exhausted
+                        # This executes if all retry attempts were exhausted
                         return False, {
                             "error": f"Test failed after {max_retries} attempts",
                             "type": "RetryError",
@@ -115,59 +170,53 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                     # Create tasks for all samples
                     tasks = [run_single_test(i) for i in range(samples)]
 
-                    # Normalize batch size (None or negative becomes "run all at once")
+                    # Normalize batch size
                     effective_batch_size = None
                     if batch_size and batch_size > 0:
                         effective_batch_size = batch_size
 
                     # Run tests with batching if specified, otherwise all at once
                     if effective_batch_size:
-                        # Run in batches
+                        # Run in batches to limit concurrency
                         for i in range(0, len(tasks), effective_batch_size):
                             batch = tasks[i:i + effective_batch_size]
                             batch_results = await asyncio.gather(*batch, return_exceptions=True)
 
-                            # Process this batch's results
+                            # Process results
                             for result in batch_results:
                                 stats.total_runs += 1
                                 if isinstance(result, Exception):
-                                    # Unexpected error
                                     stats.failures.append({
                                         "error": str(result),
                                         "type": type(result).__name__,
                                         "context": {"unexpected_error": True},
                                     })
                                 elif result is True:
-                                    # Success
                                     stats.successful_runs += 1
                                 else:
-                                    # Expected failure format (False, failure_info)
                                     stats.failures.append(result[1])
                     else:
                         # Run all tests at once
                         all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                        # Process all results
+                        # Process results
                         for result in all_results:
                             stats.total_runs += 1
                             if isinstance(result, Exception):
-                                # Unexpected error
                                 stats.failures.append({
                                     "error": str(result),
                                     "type": type(result).__name__,
                                     "context": {"unexpected_error": True},
                                 })
                             elif result is True:
-                                # Success
                                 stats.successful_runs += 1
                             else:
-                                # Expected failure format (False, failure_info)
                                 stats.failures.append(result[1])
 
-                    # Store results for reporting
+                    # Store test results for final reporting
                     _test_results[item.nodeid] = stats
 
-                    # Check if we met the threshold
+                    # Fail the test if success rate is below threshold
                     if stats.success_rate < threshold:
                         message = (
                             f"Stochastic test failed: success rate {stats.success_rate:.2f} below threshold {threshold}\n"  # noqa: E501
@@ -177,61 +226,88 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                         )
                         raise AssertionError(message)
 
-                # Copy needed metadata from original function
+                # Copy metadata from original function to wrapper to preserve
+                # important attributes like name and module for pytest reporting
                 stochastic_async_wrapper.__name__ = original_func.__name__
                 stochastic_async_wrapper.__module__ = original_func.__module__
                 if hasattr(original_func, '__qualname__'):
                     stochastic_async_wrapper.__qualname__ = original_func.__qualname__
 
-                # Replace the function with our wrapper
+                # Replace the original test function with our wrapper
                 item.obj = stochastic_async_wrapper
 
 def has_asyncio_marker(obj: pytest.Function | object) -> bool:
     """
-    Check if an object has pytest.mark.asyncio marker.
+    Check if an object has pytest.mark.asyncio marker or is asynchronous.
 
-    Works for both test functions and test classes.
+    This function performs comprehensive detection of async tests, checking:
+    1. Direct pytest.mark.asyncio markers on the function
+    2. Inherited markers from test classes
+    3. Native coroutine functions (even without explicit markers)
+
+    This comprehensive detection is essential because we need different
+    execution paths for async vs sync stochastic tests.
 
     Args:
         obj: A pytest function item or any object that might have markers
 
     Returns:
-        True if the object has asyncio marker, False otherwise
+        True if the object has asyncio marker or is a coroutine, False otherwise
     """
-    # Check if it's a pytest function with own markers
+    # Check if it's a pytest function with its own markers
     if hasattr(obj, 'own_markers'):
         for marker in obj.own_markers:
             if marker.name == 'asyncio':
                 return True
 
-    # Check if it's in a class with asyncio marker
+    # Check if it's in a class with asyncio marker (inheritance case)
     if hasattr(obj, 'cls') and obj.cls is not None:  # noqa: SIM102
         if hasattr(obj.cls, 'pytestmark'):
             for marker in obj.cls.pytestmark:
                 if marker.name == 'asyncio':
                     return True
 
-    # Check if the object itself is a class with pytestmark
+    # Check if the object itself is a class method with pytestmark
     if hasattr(obj, '__self__') and obj.__self__ is not None:  # noqa: SIM102
         if hasattr(obj.__self__.__class__, 'pytestmark'):
             for marker in obj.__self__.__class__.pytestmark:
                 if marker.name == 'asyncio':
                     return True
 
-    # If none of the above checks detected an asyncio marker but
-    # the function is a coroutine function, we'll need to treat it
-    # as an asyncio test to avoid errors
+    # Detect coroutine functions even without explicit markers
+    # This is needed to handle async functions in pytest-asyncio's auto mode
     if hasattr(obj, 'obj') and inspect.iscoroutinefunction(obj.obj):  # noqa: SIM103
         return True
 
     return False
 
 def is_async_function(func: callable) -> bool:
-    """Check if a function is asynchronous."""
+    """
+    Check if a function is asynchronous (defined with async def).
+
+    This is a simple utility wrapper around inspect.iscoroutinefunction
+    that makes the code more readable. Used to determine execution path
+    for different function types.
+
+    Args:
+        func: The function to check
+
+    Returns:
+        True if the function is a coroutine function, False otherwise
+    """
     return inspect.iscoroutinefunction(func)
 
 def pytest_addoption(parser: pytest.Parser) -> None:
-    """Add command-line options."""
+    """
+    Add plugin-specific command-line options to pytest.
+
+    This adds the --disable-stochastic flag that allows users to
+    temporarily disable all stochastic test features without removing
+    markers from test code.
+
+    Args:
+        parser: The pytest command line parser
+    """
     parser.addoption(
         "--disable-stochastic",
         action="store_true",
@@ -240,20 +316,37 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
-    """Execute stochastic tests."""
+    """
+    Custom test execution hook for synchronous stochastic tests.
+
+    This function intercepts the test execution phase for synchronous tests
+    marked with @stochastic and runs them multiple times with the specified
+    parameters. We use tryfirst to ensure we get priority before other hooks.
+
+    Note: Async tests are handled separately in pytest_collection_modifyitems
+    because they need to be wrapped before execution.
+
+    Args:
+        pyfuncitem: The pytest function item being executed
+
+    Returns:
+        True if we handled the test, None to let pytest handle it normally
+    """
+    # Check if this test has the stochastic marker
     marker = pyfuncitem.get_closest_marker("stochastic")
     if not marker:
-        return None  # Not a stochastic test, let pytest handle it
+        return None  # Not a stochastic test, let pytest handle it normally
 
-    # Check if stochastic mode is disabled
+    # Skip stochastic behavior if disabled via command line
     if pyfuncitem.config.getoption("--disable-stochastic", False):
-        return None  # Run normally
+        return None  # Run the test normally (just once)
 
-    # For async tests, our collection modification hook already handled it
+    # For async tests, we already modified them during collection
+    # Let pytest-asyncio handle them with our wrapper in place
     if has_asyncio_marker(pyfuncitem):
-        return None  # Let pytest-asyncio handle the test with our wrapper
+        return None
 
-    # Get stochastic parameters from marker
+    # Extract stochastic parameters with sensible defaults
     samples = marker.kwargs.get('samples', 10)
     threshold = marker.kwargs.get('threshold', 0.5)
     batch_size = marker.kwargs.get('batch_size', None)
@@ -261,23 +354,24 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     max_retries = marker.kwargs.get('max_retries', 3)
     timeout = marker.kwargs.get('timeout', None)
 
-    # Initialize stats
+    # Initialize statistics tracker for this test
     stats = StochasticTestStats()
 
-    # Get the function to test
+    # Get the original test function
     testfunction = pyfuncitem.obj
 
-    # Get only the function arguments that it actually needs
+    # Filter arguments to only pass those the function accepts
     sig = inspect.signature(testfunction)
     actual_argnames = set(sig.parameters.keys())
     funcargs = {name: arg for name, arg in pyfuncitem.funcargs.items() if name in actual_argnames}
 
-    # Create a new event loop for the test
+    # Create a new event loop for running sync tests via our async helper
+    # This is needed because even sync tests use async execution for concurrency
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
-        # Run the stochastic tests
+        # Execute the sync test using our async test runner
         loop.run_until_complete(
             _run_stochastic_tests(
                 testfunction=testfunction,
@@ -291,15 +385,15 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
             ),
         )
     finally:
-        # Always clean up
+        # Always clean up resources even if there are exceptions
         loop.close()
-        # Reset the event loop policy to default for pytest-asyncio compatibility
+        # Reset the event loop to avoid interference with pytest-asyncio
         asyncio.set_event_loop(None)
 
-    # Store the results for reporting
+    # Store test results for terminal reporting
     _test_results[pyfuncitem.nodeid] = stats
 
-    # If we didn't meet the threshold, raise an AssertionError
+    # Fail if success rate is below threshold
     if stats.success_rate < threshold:
         message = (
             f"Stochastic test failed: success rate {stats.success_rate:.2f} below threshold {threshold}\n"  # noqa: E501
@@ -309,7 +403,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
         )
         raise AssertionError(message)
 
-    return True  # We handled this test
+    return True  # Signal to pytest that we handled the test execution
 
 async def run_test_function(
     testfunction: callable,
@@ -317,21 +411,28 @@ async def run_test_function(
     timeout: int | None = None,  # noqa: ASYNC109
 ) -> object:
     """
-    Execute a test function with optional timeout.
+    Execute a test function with optional timeout, handling both sync and async functions.
 
-    Handles both sync and async functions, and properly awaits coroutines.
+    This is a universal test function executor that correctly handles:
+    1. Native async functions (defined with async def)
+    2. Synchronous functions (regular functions)
+    3. Synchronous functions that return awaitables (coroutines/futures)
+
+    It applies timeouts consistently across all function types and ensures
+    proper exception propagation. This is critical for running both sync
+    and async tests in a unified stochastic framework.
 
     Args:
-        testfunction: The test function to execute
-        funcargs: Arguments to pass to the test function
-        timeout: Optional timeout in seconds
+        testfunction: The test function to execute (can be sync or async)
+        funcargs: Dictionary of arguments to pass to the test function
+        timeout: Optional timeout in seconds after which the test will be cancelled
 
     Returns:
         The result of the function call
 
     Raises:
-        TimeoutError: If the function execution exceeds the timeout
-        Any exceptions raised by the test function
+        TimeoutError: If the function execution exceeds the specified timeout
+        Any exceptions raised by the test function itself
     """
     # Determine if the function is asynchronous
     is_async = inspect.iscoroutinefunction(testfunction) or (
@@ -380,7 +481,19 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
         timeout: int | None = None,
     ) -> None:
     """
-    Run stochastic tests for async tests without creating a new event loop.
+    Run stochastic tests for async functions using the existing event loop.
+
+    This function handles the parallel execution of async test functions,
+    with batching and retry capabilities. It uses the current event loop
+    rather than creating a new one, which is more efficient for async tests.
+
+    The key advantage of this function is its ability to control concurrency
+    through batching, which helps prevent resource exhaustion when running
+    many samples of resource-intensive tests (like network calls or database operations).
+
+    It's used primarily for:
+    1. Direct calls from non-pytest code
+    2. Tests run through the pytest test execution hook
 
     Args:
         testfunction: The async test function to execute
@@ -409,36 +522,26 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
     if batch_size is not None and batch_size <= 0:
         batch_size = None  # Treat negative or zero batch_size as None
 
-    # Create a coroutine that will apply timeout logic and capture exceptions
     async def run_test_with_timeout(run_index: int, attempt: int) -> tuple[bool, object]:
         """Helper to run a single test with timeout handling."""
         context = {"run_index": run_index}
 
         try:
-            # Create a copy of the function args for this run
             run_args = funcargs.copy()
 
-            # Run the test function with proper timeout
             if timeout is not None:
                 try:
-                    # Apply timeout using asyncio.wait_for
                     await asyncio.wait_for(testfunction(**run_args), timeout=timeout)
                 except TimeoutError:
-                    # Convert asyncio's TimeoutError to our TimeoutError
                     raise TimeoutError(f"Test timed out after {timeout} seconds")
             else:
-                # No timeout, just run the test
                 await testfunction(**run_args)
 
-            # If we get here, the test passed
             return True, None
         except Exception as e:
-            # Check if we should retry this exception
             if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:
-                # Signal that we should retry
                 return False, "retry"
             else:  # noqa: RET505
-                # Return the exception for recording in stats
                 return False, (str(e), type(e).__name__, context)
 
     # Get the current loop, or create a new one to handle deprecation
@@ -549,7 +652,18 @@ async def _run_stochastic_tests(
         timeout: int | None = None,  # noqa: ASYNC109
     ) -> list[bool]:
     """
-    Run tests multiple times and collect statistics.
+    Internal helper to run tests multiple times with concurrency and statistics collection.
+
+    This is the core implementation shared by both synchronous and asynchronous test paths.
+    It handles batched execution, retries, and timeout control in a unified way for both
+    sync and async functions.
+
+    Key features:
+    - Runs multiple samples concurrently in configurable batch sizes
+    - Supports retrying specific exceptions a configurable number of times
+    - Automatically handles both sync and async test functions
+    - Applies timeout control to prevent hanging tests
+    - Tracks detailed statistics on test runs
 
     Args:
         testfunction: The test function to execute (can be sync or async)
@@ -618,21 +732,18 @@ async def _run_stochastic_tests(
                 batch = coroutines[i:i + batch_size]
                 try:
                     batch_results = await asyncio.gather(*batch, return_exceptions=True)
-                    # Handle exceptions
                     for result in batch_results:
                         if isinstance(result, Exception):
-                            # Log the exception but treat as a failed test
                             print(f"Exception during test execution: {result}")
                             results.append(False)
                         else:
                             results.append(result)
                 except Exception as e:
-                    # This should rarely happen, but just in case
                     print(f"Unexpected error during batch execution: {e}")
                     results.extend([False] * len(batch))
             return results
         else:  # noqa: RET505
-            # If no batch size or invalid batch size, run all at once with error handling
+            # Run all tests at once
             results = await asyncio.gather(*coroutines, return_exceptions=True)
             return [r if not isinstance(r, Exception) else False for r in results]
 
@@ -641,13 +752,35 @@ async def _run_stochastic_tests(
 
 @pytest.hookimpl(trylast=True)
 def pytest_terminal_summary(terminalreporter) -> None:  # noqa: ANN001
-    """Add stochastic test results to terminal summary."""
+    """
+    Add stochastic test results to the pytest terminal output.
+
+    This hook runs at the end of the test session and provides a detailed
+    summary of all stochastic tests that were executed, including:
+    - Success rates for each test
+    - Number of total runs, successes, and failures
+    - Sample error information for failures
+
+    This summary is valuable for understanding the statistical properties
+    of non-deterministic tests and diagnosing intermittent failures.
+
+    We use trylast to ensure this summary appears after other test results.
+
+    Args:
+        terminalreporter: The pytest terminal reporter object
+    """
+    # Only add summary if we have stochastic test results to report
     if _test_results:
         terminalreporter.write_sep("=", "Stochastic Test Results")
         for nodeid, stats in _test_results.items():
+            # Write test identifier
             terminalreporter.write_line(f"\n{nodeid}:")
+            # Show success rate with 2 decimal precision
             terminalreporter.write_line(f"  Success rate: {stats.success_rate:.2f}")
+            # Show overall statistics
             terminalreporter.write_line(f"  Runs: {stats.total_runs}, Successes: {stats.successful_runs}, Failures: {len(stats.failures)}")  # noqa: E501
+
+            # Show sample failures if any exist (up to 3 to avoid overwhelming output)
             if stats.failures:
                 terminalreporter.write_line("  Failure samples:")
                 for i, failure in enumerate(stats.failures[:3]):
