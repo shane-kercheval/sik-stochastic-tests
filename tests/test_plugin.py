@@ -9,7 +9,9 @@ from sik_stochastic_tests.plugin import (
     StochasticTestStats,
     _run_stochastic_tests,
     pytest_pyfunc_call,
+    run_stochastic_tests_for_async,
 )
+from typing import Never
 
 def test_has_asyncio_marker():
     """Test the has_asyncio_marker helper function."""
@@ -519,6 +521,132 @@ def test_async_batch_processing():
     # Note: This may not always be true depending on exact timing, so we use a higher number
     # to account for possible event loop scheduling variations
     assert tracker2.max_active > 2, f"Expected higher concurrency without batching, got {tracker2.max_active}"  # noqa: E501
+
+@pytest.mark.asyncio
+async def test_edge_cases_parameter_validation():
+    """Test parameter validation for edge cases in stochastic functions."""
+    # Simple test function that always succeeds
+    async def test_func() -> bool:
+        return True
+
+    stats = StochasticTestStats()
+
+    # Test negative samples validation
+    with pytest.raises(ValueError, match="samples must be a positive integer"):
+        await _run_stochastic_tests(
+            testfunction=test_func,
+            funcargs={},
+            stats=stats,
+            samples=-1,  # Invalid negative samples
+            batch_size=None,
+            retry_on=None,
+            max_retries=1,
+            timeout=None,
+        )
+
+    # Test zero samples validation
+    with pytest.raises(ValueError, match="samples must be a positive integer"):
+        await _run_stochastic_tests(
+            testfunction=test_func,
+            funcargs={},
+            stats=stats,
+            samples=0,  # Invalid zero samples
+            batch_size=None,
+            retry_on=None,
+            max_retries=1,
+            timeout=None,
+        )
+
+    # Test invalid retry_on parameter
+    with pytest.raises(ValueError, match="retry_on must contain only exception types"):
+        await _run_stochastic_tests(
+            testfunction=test_func,
+            funcargs={},
+            stats=stats,
+            samples=1,
+            batch_size=None,
+            retry_on=["not_an_exception", ValueError],  # Invalid retry_on with a string
+            max_retries=1,
+            timeout=None,
+        )
+
+    # Test negative batch_size normalization
+    # This shouldn't raise an error, but should treat negative batch_size as None
+    await _run_stochastic_tests(
+        testfunction=test_func,
+        funcargs={},
+        stats=stats,
+        samples=1,
+        batch_size=-5,  # Negative batch_size
+        retry_on=None,
+        max_retries=1,
+        timeout=None,
+    )
+    assert stats.total_runs == 1
+    assert stats.successful_runs == 1
+
+    # Test the same validations for run_stochastic_tests_for_async
+    with pytest.raises(ValueError, match="samples must be a positive integer"):
+        run_stochastic_tests_for_async(
+            testfunction=test_func,
+            funcargs={},
+            stats=stats,
+            samples=-1,
+            batch_size=None,
+            retry_on=None,
+            max_retries=1,
+            timeout=None,
+        )
+
+    with pytest.raises(ValueError, match="retry_on must contain only exception types"):
+        run_stochastic_tests_for_async(
+            testfunction=test_func,
+            funcargs={},
+            stats=stats,
+            samples=1,
+            batch_size=None,
+            retry_on=["not_an_exception"],
+            max_retries=1,
+            timeout=None,
+        )
+
+def test_retry_exhaustion():
+    """Test that retry exhaustion is properly reported."""
+    # Create a test function that always fails with a retriable exception
+    class TestTracker:
+        def __init__(self):
+            self.attempts = 0
+
+        async def always_fail(self) -> Never:
+            self.attempts += 1
+            raise ValueError("Intentional failure for retry test")
+
+    tracker = TestTracker()
+    stats = StochasticTestStats()
+
+    # Run with retries, but it will still fail after max_retries
+    run_stochastic_tests_for_async(
+        testfunction=tracker.always_fail,
+        funcargs={},
+        stats=stats,
+        samples=1,
+        batch_size=None,
+        retry_on=[ValueError],  # Make ValueError retriable
+        max_retries=3,  # Allow 3 attempts
+        timeout=None,
+    )
+
+    # Check attempts
+    assert tracker.attempts == 3, "Should have attempted the test exactly 3 times"
+
+    # Check stats
+    assert stats.total_runs == 1
+    assert stats.successful_runs == 0
+    assert len(stats.failures) == 1
+
+    # Check error details
+    failure = stats.failures[0]
+    assert "RetryError" in failure["type"] or "ValueError" in failure["type"]
 
 ####
 # Integration tests for the stochastic plugin.

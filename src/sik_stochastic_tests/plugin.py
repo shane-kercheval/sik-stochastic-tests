@@ -323,7 +323,35 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
         max_retries: int = 3,
         timeout: int | None = None,
     ) -> None:
-    """Run stochastic tests for async tests without creating a new event loop."""
+    """
+    Run stochastic tests for async tests without creating a new event loop.
+
+    Args:
+        testfunction: The async test function to execute
+        funcargs: Arguments to pass to the test function
+        stats: Statistics object to track test results
+        samples: Number of times to run the test (must be positive)
+        batch_size: Number of tests to run concurrently (None or <= 0 runs all at once)
+        retry_on: Exception types that should trigger a retry
+        max_retries: Maximum number of retry attempts per test
+        timeout: Maximum time in seconds for each test execution
+
+    Raises:
+        ValueError: If samples is not positive or if retry_on contains non-exception types
+    """
+    # Validate inputs
+    if samples <= 0:
+        raise ValueError("samples must be a positive integer")
+
+    # Validate retry_on contains only exception types
+    if retry_on is not None:
+        for exc in retry_on:
+            if not isinstance(exc, type) or not issubclass(exc, Exception):
+                raise ValueError(f"retry_on must contain only exception types, got {exc}")
+
+    # Normalize batch_size
+    if batch_size is not None and batch_size <= 0:
+        batch_size = None  # Treat negative or zero batch_size as None
 
     # Create a coroutine that will apply timeout logic and capture exceptions
     async def run_test_with_timeout(run_index: int, attempt: int) -> tuple[bool, object]:
@@ -363,9 +391,11 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
     except RuntimeError:
         # No running event loop, create a new one
         loop = asyncio.new_event_loop()
+        # Set it as the current event loop
+        asyncio.set_event_loop(loop)
 
     # Create tasks to run in parallel
-    async def run_single_sample(i: int) -> None:
+    async def run_single_sample(i: int) -> tuple[bool, tuple | None]:
         # For each sample, try up to max_retries times
         for attempt in range(max_retries):
             success, result = await run_test_with_timeout(i, attempt)
@@ -374,11 +404,14 @@ def run_stochastic_tests_for_async(  # noqa: PLR0915
                 # Test passed
                 return True, None
             if result == "retry":
-                # Retry the test
-                continue
+                # Retry the test if we haven't exhausted all attempts
+                if attempt < max_retries - 1:
+                    continue
+                # Otherwise, mark as a retry exhaustion
+                return False, (f"Test failed after {max_retries} attempts", "RetryError", {"run_index": i})  # noqa: E501
             # Test failed, return the failure details
             return False, result
-        # If we exhausted all retries
+        # If we exhausted all retries (defensive programming - this line should never be reached)
         return False, (f"Test failed after {max_retries} attempts", "RetryError", {"run_index": i})
 
     # Run tasks with optional batching
@@ -459,7 +492,38 @@ async def _run_stochastic_tests(
         max_retries: int = 3,
         timeout: int | None = None,  # noqa: ASYNC109
     ) -> list[bool]:
-    """Run tests multiple times and collect statistics."""
+    """
+    Run tests multiple times and collect statistics.
+
+    Args:
+        testfunction: The test function to execute (can be sync or async)
+        funcargs: Arguments to pass to the test function
+        stats: Statistics object to track test results
+        samples: Number of times to run the test (must be positive)
+        batch_size: Number of tests to run concurrently (None or <= 0 runs all at once)
+        retry_on: Exception types that should trigger a retry
+        max_retries: Maximum number of retry attempts per test
+        timeout: Maximum time in seconds for each test execution
+
+    Returns:
+        A list of boolean results indicating success/failure for each sample
+
+    Raises:
+        ValueError: If samples is not positive or if retry_on contains non-exception types
+    """
+    # Validate inputs
+    if samples <= 0:
+        raise ValueError("samples must be a positive integer")
+
+    # Validate retry_on contains only exception types
+    if retry_on is not None:
+        for exc in retry_on:
+            if not isinstance(exc, type) or not issubclass(exc, Exception):
+                raise ValueError(f"retry_on must contain only exception types, got {exc}")
+
+    # Normalize batch_size
+    if batch_size is not None and batch_size <= 0:
+        batch_size = None  # Treat negative or zero batch_size as None
     async def run_single_test(run_index: int) -> bool:
         context = {"run_index": run_index}
         for attempt in range(max_retries):
