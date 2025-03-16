@@ -120,19 +120,34 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 original_func = item.obj
 
                 # Create a wrapper that will implement stochastic behavior for async tests
-                # 1. Maintain the original function signature
+                # 
+                # IMPORTANT: The interaction between pytest-asyncio and our plugin requires
+                # special handling of function signatures. 
+                #
+                # When pytest-asyncio processes an async test:
+                # 1. It wraps the original function with pytest_asyncio.plugin.wrap_in_sync()
+                # 2. It calls this wrapped function with the exact fixture values it collected
+                # 3. If the test has **kwargs parameters, pytest-asyncio needs to pass them correctly
+                #
+                # Our stochastic wrapper must therefore:
+                # 1. Preserve the EXACT parameter signature of the original test function
+                # 2. Forward parameters to the original function with the exact same structure
+                # 3. Handle special cases like *args and **kwargs correctly
+                #
+                # If we don't do this, we get errors like:
+                # "TypeError: missing required positional argument 'kwargs'" 
+                # This happens because pytest-asyncio sees 'kwargs' as a positional parameter
+                # instead of a variable keyword parameter (**kwargs) if we don't preserve the signature.
                 sig = inspect.signature(original_func)
                 
-                # Create a wrapper using the exact same parameter specification 
-                # This is key to ensuring fixtures are properly injected
-                print(f"DEBUG - Creating wrapper for {original_func.__name__} with signature {sig}")
-                print(f"DEBUG - Original function: {original_func}")
-                print(f"DEBUG - Parameters: {list(sig.parameters.keys())}")
-                print(f"DEBUG - Parameter kinds: {[(name, param.kind) for name, param in sig.parameters.items()]}")
-                print(f"DEBUG - Item.funcargs: {getattr(item, 'funcargs', 'No funcargs')}")
-                
-                # We need to preserve the EXACT parameter structure of the original function
-                # including VAR_POSITIONAL (*args) and VAR_KEYWORD (**kwargs) parameters
+                # Create a parameter string that exactly matches the original function's signature.
+                # This is CRITICAL for proper fixture injection and interaction with pytest-asyncio.
+                # We must handle each parameter kind differently:
+                # - POSITIONAL_ONLY: rare in Python but needs special handling
+                # - POSITIONAL_OR_KEYWORD: regular parameters like "request" or "fixture_name"
+                # - KEYWORD_ONLY: parameters that can only be passed by keyword (after *)
+                # - VAR_POSITIONAL: *args parameters that collect extra positional arguments
+                # - VAR_KEYWORD: **kwargs parameters that collect extra keyword arguments
                 param_list = []
                 for name, param in sig.parameters.items():
                     if param.kind == inspect.Parameter.POSITIONAL_ONLY:
@@ -147,24 +162,33 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                         param_list.append(f"**{name}")
                 
                 param_str = ", ".join(param_list)
-                print(f"DEBUG - Generated param string: {param_str}")
                 
-                # Build code to reconstruct the params dict for passing to the original function
-                param_reconstruction = []
-                has_var_positional = False
-                var_positional_name = ""
-                has_var_keyword = False
-                var_keyword_name = ""
-                
+                # When we call the original function from inside our wrapper, we need to
+                # forward all parameters exactly as they were received. This is especially
+                # important for *args and **kwargs parameters.
+                #
+                # We can't use a simple **locals() approach because that would include
+                # other local variables besides the function parameters.
+                param_forwarding = []
                 for name, param in sig.parameters.items():
                     if param.kind == inspect.Parameter.VAR_POSITIONAL:
-                        has_var_positional = True
-                        var_positional_name = name
+                        # For *args parameters, we need to unpack them with *
+                        param_forwarding.append(f"*{name}")
                     elif param.kind == inspect.Parameter.VAR_KEYWORD:
-                        has_var_keyword = True
-                        var_keyword_name = name
+                        # For **kwargs parameters, we need to unpack them with **
+                        param_forwarding.append(f"**{name}")
+                    else:
+                        # For all other parameters, we pass them as keyword arguments
+                        # to ensure they're correctly passed regardless of order
+                        param_forwarding.append(f"{name}={name}")
                 
-                # This is the key part that preserves the original function signature
+                param_passing = ", ".join(param_forwarding)
+                
+                # The exec_context provides all the variables that will be accessible
+                # inside our dynamically created wrapper function.
+                # 
+                # IMPORTANT: The module-level _test_results dictionary must be included
+                # for the wrapper to store test results that will be reported at the end.
                 exec_context = {'pytest': pytest, 
                                'original_func': original_func,
                                'samples': samples,
@@ -177,52 +201,20 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                                'StochasticTestStats': StochasticTestStats,
                                'TimeoutError': TimeoutError,
                                'Exception': Exception,
-                               'inspect': inspect,
-                               '_test_results': _test_results,  # Add this here
+                               '_test_results': _test_results,
                                'item_nodeid': item.nodeid}
 
-                # Construct param_passing code for calling the original function
-                param_passing = ""
-                if has_var_positional and has_var_keyword:
-                    # Function has both *args and **kwargs
-                    regular_params = [name for name, param in sig.parameters.items() 
-                                     if param.kind not in (inspect.Parameter.VAR_POSITIONAL, 
-                                                          inspect.Parameter.VAR_KEYWORD)]
-                    param_passing = ", ".join([f"{name}={name}" for name in regular_params])
-                    if param_passing:
-                        param_passing += f", *{var_positional_name}, **{var_keyword_name}"
-                    else:
-                        param_passing = f"*{var_positional_name}, **{var_keyword_name}"
-                elif has_var_keyword:
-                    # Function has **kwargs only
-                    regular_params = [name for name, param in sig.parameters.items() 
-                                     if param.kind != inspect.Parameter.VAR_KEYWORD]
-                    param_passing = ", ".join([f"{name}={name}" for name in regular_params])
-                    if param_passing:
-                        param_passing += f", **{var_keyword_name}"
-                    else:
-                        param_passing = f"**{var_keyword_name}"
-                elif has_var_positional:
-                    # Function has *args only
-                    regular_params = [name for name, param in sig.parameters.items() 
-                                     if param.kind != inspect.Parameter.VAR_POSITIONAL]
-                    param_passing = ", ".join([f"{name}={name}" for name in regular_params])
-                    if param_passing:
-                        param_passing += f", *{var_positional_name}"
-                    else:
-                        param_passing = f"*{var_positional_name}"
-                else:
-                    # Function has only regular parameters
-                    param_passing = ", ".join([f"{name}={name}" for name in sig.parameters.keys()])
-                
-                print(f"DEBUG - Parameter passing code: {param_passing}")
-
-                # Define the wrapper function preserving parameter names
+                # Define the wrapper function with our dynamically created parameter signature.
+                # We use exec() to create a function with the exact parameter structure we need.
+                # 
+                # The @pytest.mark.asyncio decorator is critical - it signals to pytest-asyncio
+                # that this is an async function that needs special handling. Without this marker,
+                # pytest-asyncio would not know to handle this as an async test.
                 wrapper_code = f"""
 @pytest.mark.asyncio
 async def stochastic_async_wrapper({param_str}):
-    print(f"DEBUG - stochastic_async_wrapper called with params types: {{[type(val).__name__ for key, val in locals().items() if key in {list(sig.parameters.keys())}]}}")
     # Create stats tracker for this test run
+    # This tracker will record successful/failed runs and provide aggregate statistics
     stats = StochasticTestStats()
 
     # Validate inputs to prevent common issues
@@ -230,32 +222,36 @@ async def stochastic_async_wrapper({param_str}):
         raise ValueError("samples must be a positive integer")
 
     # Helper function to run a single test sample with retry logic
+    # This encapsulates the retry mechanism for each individual run of the test
     async def run_single_test(i: int):
         for attempt in range(max_retries):
             try:
                 # Apply timeout if specified to prevent tests from hanging
                 if timeout is not None:
                     try:
-                        # asyncio.wait_for cancels the task if it exceeds the timeout
-                        # Pass parameters directly with the exact same structure as received
+                        # IMPORTANT: We pass parameters EXACTLY as they were received
+                        # This is vital for proper handling of fixtures and special parameter types
                         test_coro = original_func({param_passing})
+                        
+                        # asyncio.wait_for cancels the task if it exceeds the timeout
                         await asyncio.wait_for(test_coro, timeout)
                     except TimeoutError:
                         raise TimeoutError(f"Test timed out after {{timeout}} seconds")
                 else:
-                    # Run the test with the exact parameters we received
-                    print(f"DEBUG - Running original_func with {param_passing}")
+                    # No timeout specified - run with the exact parameters we received
+                    # The {param_passing} code preserves the exact parameter structure
                     await original_func({param_passing})
 
                 # If we get here without an exception, the test passed
                 return True
             except Exception as e:
-                # Check if this exception should trigger a retry
+                # If this exception type is in retry_on, we'll retry the test
                 if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:
                     # Continue to the next retry attempt
                     continue
 
-                # If we're not retrying, record the failure details
+                # If we're not retrying, record detailed failure information
+                # This helps with debugging flaky tests by capturing context
                 failure_info = {{
                     "error": str(e),
                     "type": type(e).__name__,
@@ -270,56 +266,72 @@ async def stochastic_async_wrapper({param_str}):
             "context": {{"run_index": i}},
         }}
 
-    # Create tasks for all samples
+    # Create a list of tasks to run the test multiple times
+    # Each task represents one execution of the test function
     tasks = [run_single_test(i) for i in range(samples)]
 
-    # Normalize batch size
+    # Handle batch execution to control concurrency
+    # This is important for resource-intensive tests where running
+    # too many instances simultaneously could cause system issues
     effective_batch_size = None
     if batch_size and batch_size > 0:
         effective_batch_size = batch_size
 
     # Run tests with batching if specified, otherwise all at once
     if effective_batch_size:
-        # Run in batches to limit concurrency
+        # Run in batches to limit concurrency - this helps prevent resource
+        # exhaustion for tests that use significant resources (network, CPU, etc.)
         for i in range(0, len(tasks), effective_batch_size):
             batch = tasks[i:i + effective_batch_size]
+            
+            # asyncio.gather runs all tasks concurrently and waits for all to complete
+            # return_exceptions=True ensures we get results even if some tasks fail
             batch_results = await asyncio.gather(*batch, return_exceptions=True)
 
-            # Process results
+            # Process results from this batch
             for result in batch_results:
                 stats.total_runs += 1
                 if isinstance(result, Exception):
+                    # Handle unexpected exceptions (not from the test itself but from our wrapper)
                     stats.failures.append({{
                         "error": str(result),
                         "type": type(result).__name__,
                         "context": {{"unexpected_error": True}},
                     }})
                 elif result is True:
+                    # Test passed
                     stats.successful_runs += 1
                 else:
+                    # Test failed with details (the second item in the tuple is the failure info)
                     stats.failures.append(result[1])
     else:
-        # Run all tests at once
+        # Run all tests at once when batching is not specified
+        # This is the most efficient for quick tests but can be resource-intensive
         all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Process results
+        # Process all results together
         for result in all_results:
             stats.total_runs += 1
             if isinstance(result, Exception):
+                # Handle unexpected exceptions
                 stats.failures.append({{
                     "error": str(result),
                     "type": type(result).__name__,
                     "context": {{"unexpected_error": True}},
                 }})
             elif result is True:
+                # Test passed
                 stats.successful_runs += 1
             else:
+                # Test failed with details
                 stats.failures.append(result[1])
 
-    # Store test results for final reporting
+    # Store test results in the global dictionary for reporting at the end of the session
+    # This is critical for the pytest_terminal_summary hook to show the stochastic test results
     _test_results[item_nodeid] = stats
 
-    # Fail the test if success rate is below threshold
+    # Enforce the success threshold - if too many test runs failed, fail the overall test
+    # The threshold is a float between 0.0 and 1.0 representing the required success rate
     if stats.success_rate < threshold:
         message = (
             f"Stochastic test failed: success rate {{stats.success_rate:.2f}} below threshold {{threshold}}\\n"
@@ -329,22 +341,29 @@ async def stochastic_async_wrapper({param_str}):
         )
         raise AssertionError(message)
 """
-                # Create the wrapper function in a controlled namespace
+                # Execute our dynamically created wrapper function code in a controlled namespace
+                # This creates the actual function object with the exact signature we need
                 local_ns = {}
                 exec(wrapper_code, exec_context, local_ns)
                 stochastic_async_wrapper = local_ns['stochastic_async_wrapper']
                 
-                # Copy metadata from original function to wrapper to preserve
-                # important attributes like name and module for pytest reporting
+                # Copy metadata from original function to wrapper
+                # This is CRITICAL for pytest to correctly identify and report the test.
+                # Without these attributes, pytest wouldn't display the correct test name
+                # in reports and the test hierarchy would be broken.
                 stochastic_async_wrapper.__name__ = original_func.__name__
                 stochastic_async_wrapper.__module__ = original_func.__module__
                 if hasattr(original_func, '__qualname__'):
                     stochastic_async_wrapper.__qualname__ = original_func.__qualname__
                 
-                # Make sure we carry the required fixtures information
+                # The signature is vitally important for fixture resolution
+                # pytest-asyncio uses this to determine which fixtures to inject
+                # Without this, fixtures would not be correctly passed to our wrapper
                 stochastic_async_wrapper.__signature__ = sig
 
                 # Replace the original test function with our wrapper
+                # This causes pytest to run our wrapper instead of the original function
+                # when it executes this test item
                 item.obj = stochastic_async_wrapper
 
 def has_asyncio_marker(obj: pytest.Function | object) -> bool:
