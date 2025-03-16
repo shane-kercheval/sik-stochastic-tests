@@ -43,9 +43,6 @@ def test_has_asyncio_marker():
     class AsyncioClass:
         pytestmark = [asyncio_marker]  # noqa: RUF012
 
-    class NonAsyncioClass:
-        pytestmark = [other_marker]  # noqa: RUF012
-
     # Test detection of direct function markers
     func_with_marker = MagicMock()
     func_with_marker.own_markers = [asyncio_marker]
