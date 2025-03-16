@@ -1,4 +1,10 @@
-"""Unit tests for the stochastic plugin components."""
+"""
+Unit tests for the stochastic pytest plugin.
+
+These tests verify both internal functionality (helper functions, statistics tracking)
+and integration behavior (through pytest subprocess calls) to ensure the plugin
+correctly handles both sync and async tests with proper concurrency.
+"""
 from pathlib import Path
 import time
 import pytest
@@ -16,43 +22,48 @@ from sik_stochastic_tests.plugin import (
 from typing import Never
 
 def test_has_asyncio_marker():
-    """Test the has_asyncio_marker helper function."""
+    """
+    Test the asyncio marker detection in various contexts.
+
+    This test verifies that all mechanisms to detect async tests work correctly:
+    - Direct markers on functions
+    - Class-level markers
+    - Method inheritance of markers
+
+    Correct detection is critical since async and sync tests follow different execution paths.
+    """
     from sik_stochastic_tests.plugin import has_asyncio_marker
 
-    # Create asyncio marker mock with correct name property
     asyncio_marker = MagicMock()
     asyncio_marker.name = 'asyncio'
 
-    # Create non-asyncio marker mock
     other_marker = MagicMock()
     other_marker.name = 'other'
 
-    # Create mock objects to test the function
     class AsyncioClass:
         pytestmark = [asyncio_marker]  # noqa: RUF012
 
     class NonAsyncioClass:
         pytestmark = [other_marker]  # noqa: RUF012
 
-    # Mock a pytest function with asyncio marker
+    # Test detection of direct function markers
     func_with_marker = MagicMock()
     func_with_marker.own_markers = [asyncio_marker]
 
-    # Mock a pytest function without asyncio marker
     func_without_marker = MagicMock()
     func_without_marker.own_markers = [other_marker]
 
-    # Mock a pytest function in asyncio class
+    # Test detection via class inheritance
     func_in_asyncio_class = MagicMock()
     func_in_asyncio_class.own_markers = []
     func_in_asyncio_class.cls = AsyncioClass
 
-    # Mock a method with asyncio class
+    # Test detection via method binding
     method_obj = MagicMock()
     method_obj.__self__ = MagicMock()
     method_obj.__self__.__class__ = AsyncioClass
 
-    # Test the function
+    # Verify correct detection in all scenarios
     assert has_asyncio_marker(func_with_marker) is True
     assert has_asyncio_marker(func_without_marker) is False
     assert has_asyncio_marker(func_in_asyncio_class) is True
@@ -60,11 +71,19 @@ def test_has_asyncio_marker():
 
 @pytest.mark.asyncio
 async def test_run_test_function():
-    """Test the run_test_function helper for different types of functions."""
-    from sik_stochastic_tests.plugin import run_test_function
+    """
+    Test the universal test function executor.
 
-    # Test cases
-    # 1. Synchronous function
+    This test verifies that run_test_function correctly handles all types of functions:
+    - Synchronous functions
+    - Asynchronous functions
+    - Sync functions that return awaitable objects
+    - Functions with timeouts
+
+    This functionality is essential for the plugin to work with different coding styles.
+    """
+    from sik_stochastic_tests.plugin import run_test_function
+    # 1. Plain synchronous function
     def sync_func(arg=None):  # noqa: ANN001, ANN202
         return arg or "sync result"
 
@@ -72,69 +91,79 @@ async def test_run_test_function():
     async def async_func(arg=None):  # noqa: ANN001, ANN202
         return arg or "async result"
 
-    # 3. Sync function that returns a coroutine
+    # 3. Special case: sync function that returns a coroutine
     def returns_coroutine(arg=None):  # noqa: ANN001, ANN202
         async def inner():  # noqa: ANN202
             return arg or "coroutine result"
         return inner()
 
-    # 4. Function with timeout
+    # 4. Function for timeout testing
     async def slow_func() -> str:
         await asyncio.sleep(0.2)
         return "slow result"
 
-    # Run the tests
-    # Sync functions
+    # Test standard synchronous function execution
     result1 = await run_test_function(sync_func, {"arg": "test"})
     assert result1 == "test"
 
-    # Async functions
+    # Test native async function execution
     result2 = await run_test_function(async_func, {"arg": "test"})
     assert result2 == "test"
 
-    # Sync functions returning coroutines
+    # Test the hybrid case - sync function returning an awaitable
     result3 = await run_test_function(returns_coroutine, {"arg": "test"})
     assert result3 == "test"
 
-    # Test timeout handling
+    # Verify timeout cancels execution when exceeded
     with pytest.raises(TimeoutError):
         await run_test_function(slow_func, {}, timeout=0.1)
 
-    # Test successful execution with sufficient timeout
+    # Verify timeout doesn't interfere when sufficient
     result4 = await run_test_function(slow_func, {}, timeout=0.3)
     assert result4 == "slow result"
 
 def test_stochastic_test_stats():
-    """Test the StochasticTestStats class."""
+    """
+    Test the statistics tracking functionality.
+
+    This test ensures the StochasticTestStats class correctly:
+    - Initializes with empty state
+    - Calculates success rate properly
+    - Stores failure information in the expected format
+
+    Proper statistics are essential for reporting and threshold evaluation.
+    """
     stats = StochasticTestStats()
 
-    # Initial state
+    # Verify initial state is clean
     assert stats.total_runs == 0
     assert stats.successful_runs == 0
     assert stats.failures == []
     assert stats.success_rate == 0.0
 
-    # After successful runs
+    # Verify success rate calculation
     stats.total_runs = 5
     stats.successful_runs = 3
     assert stats.success_rate == 0.6
 
-    # With failures
+    # Verify failure recording
     stats.failures.append({"error": "Test error", "type": "ValueError", "context": {"run_index": 1}})  # noqa: E501
     assert len(stats.failures) == 1
     assert stats.failures[0]["type"] == "ValueError"
 
 @pytest.mark.asyncio
 async def test_run_stochastic_tests_success():
-    """Test running stochastic tests with all successes."""
-    # Mock test function
+    """
+    Test the core test runner with uniformly successful tests.
+
+    This verifies the stochastic test runner correctly handles the ideal case
+    where all test samples pass, ensuring statistics are properly tracked.
+    """
     async def test_func() -> bool:
         return True
 
-    # Test statistics
     stats = StochasticTestStats()
 
-    # Run the tests
     await _run_stochastic_tests(
         testfunction=test_func,
         funcargs={},
@@ -146,7 +175,7 @@ async def test_run_stochastic_tests_success():
         timeout=None,
     )
 
-    # Verify stats
+    # Verify all tests passed and statistics match
     assert stats.total_runs == 5
     assert stats.successful_runs == 5
     assert len(stats.failures) == 0
@@ -154,20 +183,28 @@ async def test_run_stochastic_tests_success():
 
 @pytest.mark.asyncio
 async def test_run_stochastic_tests_failures():
-    """Test running stochastic tests with some failures."""
-    # Create a counter to control failures
+    """
+    Test the stochastic runner with predictably failing tests.
+
+    This verifies the runner correctly:
+    - Properly counts both successes and failures
+    - Records detailed failure information
+    - Calculates the correct success rate
+
+    Testing with mixed success/failure is important since stochastic
+    tests are designed primarily for flaky tests.
+    """
+    # Use a counter to create deterministic failure pattern
     counter = {'value': 0}
 
     async def test_func_with_failures() -> bool:
         counter['value'] += 1
-        if counter['value'] % 2 == 0:  # Every second call will fail
+        if counter['value'] % 2 == 0:  # Alternate success/failure
             raise ValueError("Simulated failure")
         return True
 
-    # Test statistics
     stats = StochasticTestStats()
 
-    # Run the tests
     await _run_stochastic_tests(
         testfunction=test_func_with_failures,
         funcargs={},
@@ -179,7 +216,7 @@ async def test_run_stochastic_tests_failures():
         timeout=None,
     )
 
-    # Verify stats
+    # Verify exactly half the tests failed as expected
     assert stats.total_runs == 4
     assert stats.successful_runs == 2
     assert len(stats.failures) == 2
@@ -188,15 +225,23 @@ async def test_run_stochastic_tests_failures():
 
 @pytest.mark.asyncio
 async def test_run_stochastic_tests_timeout():
-    """Test running stochastic tests with timeout."""
+    """
+    Test timeout handling in stochastic tests.
+
+    This verifies that:
+    - Tests exceeding the timeout are properly terminated
+    - Timeouts are correctly recorded as failures
+    - The failure information includes the correct error type
+
+    Timeouts are critical for preventing hung tests in production environments.
+    """
     async def slow_test() -> bool:
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)  # Deliberately longer than timeout
         return True
 
-    # Test statistics
     stats = StochasticTestStats()
 
-    # Run the tests with a short timeout
+    # Run with a timeout shorter than the test duration
     await _run_stochastic_tests(
         testfunction=slow_test,
         funcargs={},
@@ -208,7 +253,7 @@ async def test_run_stochastic_tests_timeout():
         timeout=0.1,
     )
 
-    # Verify stats
+    # Verify test timed out and was recorded correctly
     assert stats.total_runs == 1
     assert stats.successful_runs == 0
     assert len(stats.failures) == 1
@@ -216,13 +261,22 @@ async def test_run_stochastic_tests_timeout():
 
 @pytest.mark.asyncio
 async def test_run_stochastic_tests_retries():
-    """Test retry functionality with async function."""
-    # Create a counter to track retries
+    """
+    Test the retry mechanism for temporary failures.
+
+    This test verifies that:
+    - Tests failing with specified exception types are retried
+    - The retry counter works correctly
+    - A test ultimately succeeding after retries is counted as successful
+
+    Retry functionality is valuable for handling transient failures
+    like network glitches or race conditions.
+    """
     attempts = {'value': 0}
 
     async def test_with_retries() -> bool:
         attempts['value'] += 1
-        if attempts['value'] < 3:  # Fail twice then succeed
+        if attempts['value'] < 3:  # Deliberately fail twice before succeeding
             raise ValueError("Temporary failure")
         return True
 
@@ -400,64 +454,78 @@ async def test_retry_specific_exceptions():
 
 @pytest.mark.asyncio
 async def test_batch_processing():
-    """Test that batch_size correctly limits concurrency."""
-    # Simplify the test to just check that the batching works correctly
-    # using a single test run with 5 samples and batch_size=2
+    """
+    Test that batch_size correctly controls concurrency in the core test runner.
 
-    # Create an array of results to track when tests start and end
-    # Using a class to ensure we have proper synchronization
+    This test verifies the batching mechanism:
+    - Properly limits the number of concurrent test executions
+    - Successfully completes all test samples
+    - Maintains accurate statistics
+
+    Concurrency control is essential for resource-intensive tests
+    that might overwhelm the system if all run simultaneously.
+    """
     class TestTracker:
         def __init__(self):
             self.active_count = 0
             self.max_active = 0
 
         async def run_test(self) -> bool:
-            # Track the number of active tests
+            # Atomically track concurrent executions
             self.active_count += 1
             self.max_active = max(self.max_active, self.active_count)
 
-            # Sleep to simulate work
+            # Simulate work with a delay
             await asyncio.sleep(0.1)
 
-            # Decrement active count
             self.active_count -= 1
             return True
 
     tracker = TestTracker()
     stats = StochasticTestStats()
 
-    # Run a batch of tests with batch_size=2
+    # Run with batch_size=2 to limit concurrency
     await _run_stochastic_tests(
         testfunction=tracker.run_test,
         funcargs={},
         stats=stats,
-        samples=5,  # Run 5 samples
-        batch_size=2,  # Max 2 concurrent
+        samples=5,
+        batch_size=2,  # Should limit to 2 concurrent tests
         retry_on=None,
         max_retries=1,
         timeout=None,
     )
 
-    # Verify the statistics
+    # Verify all tests completed successfully
     assert stats.total_runs == 5
     assert stats.successful_runs == 5
     assert len(stats.failures) == 0
 
-    # Check that we never had more than 2 tests running at once
+    # Verify concurrency was limited
     assert tracker.max_active <= 2, f"Expected max 2 concurrent tests, got {tracker.max_active}"
 
 def test_async_batch_processing():
-    """Test that batch_size correctly limits concurrency in run_stochastic_tests_for_async."""
+    """
+    Test batching mechanism in the async-specific test runner.
+
+    This test verifies that the specialized run_stochastic_tests_for_async function:
+    - Properly implements concurrent execution with batching
+    - Respects batch size limits when specified
+    - Runs with higher concurrency when no batching is used
+    - Maintains accurate statistics in both scenarios
+
+    Having a dedicated async runner is important for optimization and
+    to avoid creating unnecessary event loops.
+    """
     import asyncio
     from sik_stochastic_tests.plugin import run_stochastic_tests_for_async
 
-    # Create a class to track concurrent test execution
     class AsyncTestTracker:
         def __init__(self):
             self.active_count = 0
             self.max_active = 0
             self.execution_order = []
-            self._lock = asyncio.Lock()
+            self._lock = asyncio.Lock()  # For thread-safe counting
 
         async def test_func(self) -> bool:
             async with self._lock:
@@ -465,7 +533,7 @@ def test_async_batch_processing():
                 self.max_active = max(self.max_active, self.active_count)
                 self.execution_order.append(f"start_{self.active_count}")
 
-            # Simulate work with a small delay
+            # Short delay to ensure overlap between concurrent executions
             await asyncio.sleep(0.05)
 
             async with self._lock:
@@ -474,92 +542,99 @@ def test_async_batch_processing():
 
             return True
 
-    # Test with batch_size=2
+    # First test: limited concurrency with batch_size=2
     tracker = AsyncTestTracker()
     stats = StochasticTestStats()
 
-    # Run the tests with batch_size=2
     run_stochastic_tests_for_async(
         testfunction=tracker.test_func,
         funcargs={},
         stats=stats,
-        samples=6,  # Run 6 samples
-        batch_size=2,  # Max 2 concurrent
+        samples=6,
+        batch_size=2,  # Limit to 2 concurrent executions
         retry_on=None,
         max_retries=1,
         timeout=None,
     )
 
-    # Verify the statistics
+    # Verify correct execution and stats
     assert stats.total_runs == 6
     assert stats.successful_runs == 6
     assert len(stats.failures) == 0
 
-    # Check that we never had more than 2 tests running at once
+    # Verify concurrency was limited
     assert tracker.max_active <= 2, f"Expected max 2 concurrent tests, got {tracker.max_active}"
 
-    # Test with no batch_size (should run all concurrently)
+    # Second test: unlimited concurrency (batch_size=None)
     tracker2 = AsyncTestTracker()
     stats2 = StochasticTestStats()
 
-    # Run the tests with no batch_size
     run_stochastic_tests_for_async(
         testfunction=tracker2.test_func,
         funcargs={},
         stats=stats2,
-        samples=6,  # Run 6 samples
-        batch_size=None,  # No batching
+        samples=6,
+        batch_size=None,  # Unlimited concurrency
         retry_on=None,
         max_retries=1,
         timeout=None,
     )
 
-    # Verify the statistics
+    # Verify execution completed correctly
     assert stats2.total_runs == 6
     assert stats2.successful_runs == 6
     assert len(stats2.failures) == 0
 
-    # With no batching, we should see more concurrency
-    # Note: This may not always be true depending on exact timing, so we use a higher number
-    # to account for possible event loop scheduling variations
+    # Verify concurrency was higher without batching
     assert tracker2.max_active > 2, f"Expected higher concurrency without batching, got {tracker2.max_active}"  # noqa: E501
 
 @pytest.mark.asyncio
 async def test_edge_cases_parameter_validation():
-    """Test parameter validation for edge cases in stochastic functions."""
-    # Simple test function that always succeeds
+    """
+    Test robust validation of edge case parameters.
+
+    This test ensures the stochastic runner properly validates inputs and
+    fails gracefully with informative error messages when invalid parameters
+    are provided, rather than silently using invalid values that could cause
+    subtle bugs or unpredictable behavior.
+
+    Validation is checked for:
+    - Negative or zero samples
+    - Invalid retry_on parameters
+    - Negative batch size handling
+    """
     async def test_func() -> bool:
         return True
 
     stats = StochasticTestStats()
 
-    # Test negative samples validation
+    # Verify rejection of negative samples
     with pytest.raises(ValueError, match="samples must be a positive integer"):
         await _run_stochastic_tests(
             testfunction=test_func,
             funcargs={},
             stats=stats,
-            samples=-1,  # Invalid negative samples
+            samples=-1,  # Should be rejected
             batch_size=None,
             retry_on=None,
             max_retries=1,
             timeout=None,
         )
 
-    # Test zero samples validation
+    # Verify rejection of zero samples
     with pytest.raises(ValueError, match="samples must be a positive integer"):
         await _run_stochastic_tests(
             testfunction=test_func,
             funcargs={},
             stats=stats,
-            samples=0,  # Invalid zero samples
+            samples=0,  # Should be rejected
             batch_size=None,
             retry_on=None,
             max_retries=1,
             timeout=None,
         )
 
-    # Test invalid retry_on parameter
+    # Verify rejection of non-exception retry_on types
     with pytest.raises(ValueError, match="retry_on must contain only exception types"):
         await _run_stochastic_tests(
             testfunction=test_func,
@@ -567,7 +642,7 @@ async def test_edge_cases_parameter_validation():
             stats=stats,
             samples=1,
             batch_size=None,
-            retry_on=["not_an_exception", ValueError],  # Invalid retry_on with a string
+            retry_on=["not_an_exception", ValueError],  # Non-exception in list
             max_retries=1,
             timeout=None,
         )
