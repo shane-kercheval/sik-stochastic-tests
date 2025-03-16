@@ -28,6 +28,108 @@ def pytest_configure(config: pytest.Config) -> None:
         "mark test to run stochastically multiple times",
     )
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_generate_tests(metafunc):
+    """Modify test collection to intercept async stochastic tests."""
+    yield
+    # This hook runs after test generation, allowing us to modify how tests will be executed
+    
+def pytest_make_collect_report(collector):
+    """Hook that runs after collection is complete but before tests are executed."""
+    # We can use this to intercept collected tests and modify them
+    return None
+    
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(session, config, items):
+    """Modify collected items to handle async stochastic tests."""
+    # Skip modification if stochastic mode is disabled
+    if config.getoption("--disable-stochastic", False):
+        return
+        
+    # This runs after all tests are collected
+    for item in items:
+        # Check if this is a stochastic test and if it's async
+        if (hasattr(item, 'get_closest_marker') and 
+                item.get_closest_marker('stochastic') and
+                hasattr(item, 'obj')):
+                
+            # Only modify async tests
+            if has_asyncio_marker(item):
+                # Get stochastic parameters
+                marker = item.get_closest_marker("stochastic")
+                samples = marker.kwargs.get('samples', 10)
+                threshold = marker.kwargs.get('threshold', 0.5)
+                batch_size = marker.kwargs.get('batch_size', None)
+                retry_on = marker.kwargs.get('retry_on', None)
+                max_retries = marker.kwargs.get('max_retries', 3)
+                timeout = marker.kwargs.get('timeout', None)
+                
+                # Get the original test function
+                original_func = item.obj
+                
+                # Create a wrapper that will implement stochastic behavior
+                @pytest.mark.asyncio  # Keep the asyncio marker
+                async def stochastic_async_wrapper(*args, **kwargs):
+                    # Create stats tracker
+                    stats = StochasticTestStats()
+                    
+                    # Run the test multiple times
+                    for i in range(samples):
+                        success = True
+                        for attempt in range(max_retries):
+                            try:
+                                # Run with timeout if specified
+                                if timeout is not None:
+                                    try:
+                                        await asyncio.wait_for(original_func(*args, **kwargs), timeout)
+                                    except asyncio.TimeoutError:
+                                        raise TimeoutError(f"Test timed out after {timeout} seconds")
+                                else:
+                                    await original_func(*args, **kwargs)
+                                
+                                # If we get here, test passed
+                                break
+                            except Exception as e:
+                                # Check if we should retry
+                                if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:
+                                    continue
+                                
+                                # Final failure
+                                success = False
+                                stats.failures.append({
+                                    "error": str(e),
+                                    "type": type(e).__name__,
+                                    "context": {"run_index": i},
+                                })
+                                break
+                        
+                        # Update stats
+                        stats.total_runs += 1
+                        if success:
+                            stats.successful_runs += 1
+                    
+                    # Store results for reporting
+                    _test_results[item.nodeid] = stats
+                    
+                    # Check if we met the threshold
+                    if stats.success_rate < threshold:
+                        message = (
+                            f"Stochastic test failed: success rate {stats.success_rate:.2f} below threshold {threshold}\n"
+                            f"Ran {stats.total_runs} times, {stats.successful_runs} successes, {len(stats.failures)} failures\n"
+                            f"Failure details: {stats.failures[:5]}" +
+                            ("..." if len(stats.failures) > 5 else "")
+                        )
+                        raise AssertionError(message)
+                
+                # Copy needed metadata from original function
+                stochastic_async_wrapper.__name__ = original_func.__name__
+                stochastic_async_wrapper.__module__ = original_func.__module__
+                if hasattr(original_func, '__qualname__'):
+                    stochastic_async_wrapper.__qualname__ = original_func.__qualname__
+                    
+                # Replace the function with our wrapper
+                item.obj = stochastic_async_wrapper
+
 def has_asyncio_marker(obj: pytest.Function | object) -> bool:
     """
     Check if an object has pytest.mark.asyncio marker.
@@ -68,6 +170,10 @@ def has_asyncio_marker(obj: pytest.Function | object) -> bool:
 
     return False
 
+def is_async_function(func: callable) -> bool:
+    """Check if a function is asynchronous."""
+    return inspect.iscoroutinefunction(func)
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Add command-line options."""
     parser.addoption(
@@ -87,10 +193,9 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     if pyfuncitem.config.getoption("--disable-stochastic", False):
         return None  # Run normally
 
-    # Check if test has asyncio marker or is an async function - if so, let pytest-asyncio handle it  # noqa: E501
-    # This avoids event loop conflicts with pytest-asyncio
+    # For async tests, our collection modification hook already handled it
     if has_asyncio_marker(pyfuncitem):
-        return None
+        return None  # Let pytest-asyncio handle the test with our wrapper
 
     # Get stochastic parameters from marker
     samples = marker.kwargs.get('samples', 10)
@@ -114,7 +219,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     # Create a new event loop for the test
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
+        
     try:
         # Run the stochastic tests
         loop.run_until_complete(
@@ -207,6 +312,84 @@ async def run_test_function(
             if inspect.isawaitable(result):
                 return await result
             return result
+
+import concurrent.futures
+
+def run_stochastic_tests_for_async(
+        testfunction: callable,
+        funcargs: dict[str, object],
+        stats: StochasticTestStats,
+        samples: int,
+        batch_size: int | None,
+        retry_on: tuple[Exception] | list[type[Exception]] | None,
+        max_retries: int = 3,
+        timeout: int | None = None,
+    ) -> None:
+    """Run stochastic tests for async tests without creating a new event loop."""
+
+    # Create a coroutine that will apply timeout logic and capture exceptions
+    async def run_test_with_timeout(run_index, attempt):
+        """Helper to run a single test with timeout handling."""
+        context = {"run_index": run_index}
+        
+        try:
+            # Create a copy of the function args for this run
+            run_args = funcargs.copy()
+            
+            # Run the test function with proper timeout
+            if timeout is not None:
+                try:
+                    # Apply timeout using asyncio.wait_for
+                    await asyncio.wait_for(testfunction(**run_args), timeout=timeout)
+                except asyncio.TimeoutError:
+                    # Convert asyncio's TimeoutError to our TimeoutError
+                    raise TimeoutError(f"Test timed out after {timeout} seconds")
+            else:
+                # No timeout, just run the test
+                await testfunction(**run_args)
+                
+            # If we get here, the test passed
+            return True, None
+        except Exception as e:
+            # Check if we should retry this exception
+            if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:
+                # Signal that we should retry
+                return False, "retry"
+            else:
+                # Return the exception for recording in stats
+                return False, (str(e), type(e).__name__, context)
+
+    # Get the current loop
+    loop = asyncio.get_event_loop()
+    
+    # Wrap the test in another async function to handle multiple samples
+    async def run_full_test():
+        for i in range(samples):
+            # For each sample, try up to max_retries times
+            for attempt in range(max_retries):
+                success, result = await run_test_with_timeout(i, attempt)
+                
+                if success:
+                    # Test passed
+                    stats.total_runs += 1
+                    stats.successful_runs += 1
+                    break  # Success, no need for more attempts
+                elif result == "retry":
+                    # Retry the test
+                    continue
+                else:
+                    # Test failed, record the failure
+                    error_msg, error_type, context = result
+                    stats.total_runs += 1
+                    stats.failures.append({
+                        "error": error_msg,
+                        "type": error_type,
+                        "context": context,
+                    })
+                    break  # Move to the next sample
+    
+    # Run the full test synchronously
+    loop.run_until_complete(run_full_test())
 
 async def _run_stochastic_tests(
         testfunction: callable,

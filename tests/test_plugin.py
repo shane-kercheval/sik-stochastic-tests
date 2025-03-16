@@ -212,7 +212,7 @@ async def test_run_stochastic_tests_timeout():
 
 @pytest.mark.asyncio
 async def test_run_stochastic_tests_retries():
-    """Test retry functionality."""
+    """Test retry functionality with async function."""
     # Create a counter to track retries
     attempts = {'value': 0}
 
@@ -242,6 +242,74 @@ async def test_run_stochastic_tests_retries():
     assert stats.successful_runs == 1
     assert len(stats.failures) == 0
     assert attempts['value'] == 3  # Should have tried 3 times
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_stochastic_retries(example_test_dir: Path, is_async: bool):
+    """Test retry functionality works in real tests for both sync and async functions."""
+    # For async tests, we need to add both stochastic and asyncio markers
+
+    # Create a counter to track runs
+    counter_file = example_test_dir / "retry_counter.txt"
+    counter_file.write_text("0")
+    
+    # Configure based on async or sync
+    test_prefix = "async " if is_async else ""
+    asyncio_import = "import asyncio\n" if is_async else ""
+    sleep_code = "await asyncio.sleep(0.01)\n        " if is_async else ""
+    
+    # Adding pytest.ini for asyncio_mode if testing async
+    if is_async:
+        pytest_ini = example_test_dir / "pytest.ini" 
+        pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+""")
+    
+    # Create a test file with retries
+    test_file = example_test_dir / "test_retries.py"
+    test_file.write_text(f"""
+import pytest
+{asyncio_import}
+@pytest.mark.stochastic(samples=1, retry_on=[ValueError], max_retries=3)
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_with_retries():
+    # Track execution count
+    with open("retry_counter.txt", "r") as f:
+        count = int(f.read())
+    
+    with open("retry_counter.txt", "w") as f:
+        f.write(str(count + 1))
+    
+    {sleep_code}
+    # Fail on first 2 attempts
+    if count < 2:
+        raise ValueError(f"Intentional failure on attempt {{count+1}}")
+    
+    # Pass on 3rd attempt
+    assert True
+""")
+
+    # Run pytest on the file
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v"],
+        capture_output=True,
+        text=True,
+        cwd=example_test_dir, check=False,
+    )
+    
+    # Print output for debugging
+    print(f"STDOUT: {result.stdout}")
+    print(f"STDERR: {result.stderr}")
+    
+    # Both sync and async tests should have retries applied
+    assert "1 passed" in result.stdout
+    
+    # Check retry count for both async and sync tests
+    with open(counter_file) as f:
+        count = int(f.read())
+    
+    # Both should retry the expected number of times
+    assert count == 3, f"Test should attempt 3 times with retries, but ran {count} times"
 
 @pytest.mark.asyncio
 async def test_run_stochastic_tests_sync_function():
@@ -432,17 +500,34 @@ def test_counted():
 
     assert count == 5, f"Test should run 5 times, but ran {count} times"
 
-def test_stochastic_failure_threshold(example_test_dir: Path):
-    """Test that stochastic tests fail if below threshold."""
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_stochastic_failure_threshold(example_test_dir: Path, is_async: bool):
+    """Test that stochastic tests fail if below threshold for both sync and async functions."""
+    # For async tests, we need to add both stochastic and asyncio markers
+        
     # Create a file to track failures
     counter_file = example_test_dir / "failure_count.txt"
     counter_file.write_text("0")
 
+    # Configure based on async or sync
+    test_prefix = "async " if is_async else ""
+    await_prefix = "await " if is_async else ""
+    asyncio_import = "import asyncio\n" if is_async else ""
+    sleep_code = "await asyncio.sleep(0.01)\n    " if is_async else ""
+    
+    # Adding pytest.ini for asyncio_mode if testing async
+    if is_async:
+        pytest_ini = example_test_dir / "pytest.ini"
+        pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+""")
+        
     # Create a test file with failures - using a more reliable failure pattern
     test_file = example_test_dir / "test_failures.py"
-    test_file.write_text("""
+    test_file.write_text(f"""
 import pytest
-
+{asyncio_import}
 # File to count executions
 COUNT_FILE = "failure_count.txt"
 import logging
@@ -451,16 +536,17 @@ import logging
 logging.basicConfig(filename='test_log.txt', level=logging.DEBUG)
 
 @pytest.mark.stochastic(samples=5, threshold=0.9)  # Require 90% success
-def test_with_failures():
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_with_failures():
     # Read and increment counter
-
     with open(COUNT_FILE, "r") as f:
         count = int(f.read())
-    logging.debug(f"Test execution count: {count}")
+    logging.debug(f"Test execution count: {{count}}")
 
     with open(COUNT_FILE, "w") as f:
         f.write(str(count + 1))
-
+    
+    {sleep_code}
     # Always fail on the first run, making success rate 80% (4/5)
     # This ensures we'll be below the 90% threshold
     if count == 0:
@@ -480,15 +566,16 @@ def test_with_failures():
     print(f"STDOUT: {result.stdout}")
     print(f"STDERR: {result.stderr}")
 
-    # Check if the test failed
+    # Both sync and async tests should fail due to threshold check
     assert "1 failed" in result.stdout
     # Verify Success rate is mentioned in output
     assert "Success rate" in result.stdout
-
-    # Verify the test ran the expected number of times
+    
+    # Check run count for both async and sync tests
     with open(counter_file) as f:
         count = int(f.read())
-
+    
+    # Both should run the expected number of times
     assert count == 5, f"Test should run 5 times, but ran {count} times"
 
 def test_stochastic_failure_threshold_2(example_test_dir: Path):
@@ -563,25 +650,43 @@ def test_with_failures():
     # which is below the 70% threshold - the test should fail
     assert "1 failed" in result.stdout, "Test should have failed due to low success rate"
 
-def test_disable_stochastic_flag(example_test_dir: Path):
-    """Test that --disable-stochastic flag makes tests run only once."""
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_disable_stochastic_flag(example_test_dir: Path, is_async: bool):
+    """Test that --disable-stochastic flag makes tests run only once for both sync and async functions."""
+    # For async tests, we need to add both stochastic and asyncio markers
+        
     # Create a counter file
     counter_file = example_test_dir / "disable_counter.txt"
     counter_file.write_text("0")
 
+    # Configure based on async or sync
+    test_prefix = "async " if is_async else ""
+    asyncio_import = "import asyncio\n" if is_async else ""
+    sleep_code = "await asyncio.sleep(0.01)\n    " if is_async else ""
+
+    # Adding pytest.ini for asyncio_mode if testing async
+    if is_async:
+        pytest_ini = example_test_dir / "pytest.ini"
+        pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+""")
+        
     # Create a test file
     test_file = example_test_dir / "test_disable.py"
-    test_file.write_text("""
+    test_file.write_text(f"""
 import pytest
-
+{asyncio_import}
 @pytest.mark.stochastic(samples=5)
-def test_disable_flag():
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_disable_flag():
     with open("disable_counter.txt", "r") as f:
         count = int(f.read())
 
     with open("disable_counter.txt", "w") as f:
         f.write(str(count + 1))
-
+    
+    {sleep_code}
     assert True
 """)
 
@@ -593,27 +698,44 @@ def test_disable_flag():
         cwd=example_test_dir, check=False,
     )
 
-    # Check if the test passed
+    # For both sync and async tests, check that the test passed with --disable-stochastic
     assert "1 passed" in result.stdout
 
-    # Verify the counter - test should have run only once
+    # For both sync and async tests, verify the counter - test should have run only once
     with open(counter_file) as f:
         count = int(f.read())
 
     assert count == 1, f"Test should run once with --disable-stochastic, but ran {count} times"
 
-def test_stochastic_timeout(example_test_dir: Path):
-    """Test that timeout functionality works."""
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_stochastic_timeout(example_test_dir: Path, is_async: bool):
+    """Test that timeout functionality works for both sync and async functions."""
+    # For async tests, we need to add both stochastic and asyncio markers
+
+    # Configure based on async or sync
+    test_prefix = "async " if is_async else ""
+    sleep_import = "import asyncio" if is_async else "import time"
+    sleep_func = "await asyncio.sleep(1.0)" if is_async else "time.sleep(1.0)"
+    
+    # Adding pytest.ini for asyncio_mode if testing async
+    if is_async:
+        pytest_ini = example_test_dir / "pytest.ini"
+        pytest_ini.write_text("""
+[pytest]
+asyncio_mode = auto
+""")
+        
     # Create a test file with a slow test
     test_file = example_test_dir / "test_timeout.py"
-    test_file.write_text("""
+    test_file.write_text(f"""
 import pytest
-import time
+{sleep_import}
 
 @pytest.mark.stochastic(samples=3, timeout=0.1)
-def test_timeout():
+{"@pytest.mark.asyncio" if is_async else ""}
+{test_prefix}def test_timeout():
     # Sleep longer than the timeout
-    time.sleep(0.5)
+    {sleep_func}
     assert True
 """)
 
@@ -625,9 +747,9 @@ def test_timeout():
         cwd=example_test_dir, check=False,
     )
 
-    # Test should fail due to timeouts
-    assert "1 failed" in result.stdout
-    assert "timeout" in result.stdout.lower()
+    # Both sync and async tests should timeout and fail
+    assert "1 failed" in result.stdout, f"Expected test to fail but got:\n{result.stdout}"
+    assert "timeout" in result.stdout.lower(), f"Expected timeout message but got:\n{result.stdout}"
 
 
 def test_asyncio_compatibility(example_test_dir: Path):
@@ -678,12 +800,11 @@ async def test_with_both_markers():
     # Check if the test passed
     assert "1 passed" in result.stdout
 
-    # Verify the counter - test should have run exactly once
-    # because with our fix, we're letting pytest-asyncio handle it directly
+    # Verify the test ran stochastically
     with open(counter_file) as f:
         count = int(f.read())
 
-    assert count == 1, f"Test should run 1 time when delegated to pytest-asyncio, but ran {count} times"  # noqa: E501
+    assert count == 3, f"Test should run 3 times with stochastic functionality, but ran {count} times"  # noqa: E501
 
 def test_asyncio_class_compatibility(example_test_dir: Path):
     """Test that plugin correctly handles tests in a class marked with pytest.mark.asyncio."""
@@ -735,11 +856,11 @@ class TestAsyncioClass:
     # Check if the test passed - our fix should bypass stochastic and let pytest-asyncio handle it
     assert "1 passed" in result.stdout
 
-    # Verify the counter - test should run once since we're delegating to pytest-asyncio
+    # Verify the test ran stochastically
     with open(counter_file) as f:
         count = int(f.read())
 
-    assert count == 1, f"Test in asyncio class should run 1 time (not {count}) with our fix that detects and avoids conflict"  # noqa: E501
+    assert count == 3, f"Test should run 3 times with stochastic functionality, but ran {count} times"  # noqa: E501
 
 
 def test_async_no_asyncio_marker(example_test_dir: Path):
@@ -799,9 +920,8 @@ async def test_async_without_asyncio_marker():
     with open(counter_file) as f:
         count = int(f.read())
 
-    # The test might run once with asyncio_mode=auto, or it might be skipped entirely
-    # but what matters is that it doesn't crash with IndexError (which was the original issue)
-    assert count <= 1, f"Async test should run 0 or 1 time, but ran {count} times"
+    # The test should run with stochastic functionality (samples=3)
+    assert count == 3, f"Async test should run 3 times with stochastic functionality, but ran {count} times"
 
 def test_has_asyncio_marker_detects_coroutines():
     """Test that has_asyncio_marker correctly identifies coroutine functions."""
