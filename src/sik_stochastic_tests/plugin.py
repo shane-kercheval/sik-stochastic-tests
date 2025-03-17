@@ -16,7 +16,6 @@ Key features:
 import pytest
 import asyncio
 import inspect
-import nest_asyncio
 from dataclasses import dataclass, field
 
 # Global dictionary to store test results for reporting at the end of the test session
@@ -501,11 +500,6 @@ def _run_stochastic_tests_in_thread(
             # Create a new event loop specific to this thread
             thread_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(thread_loop)
-            
-            # Apply nest_asyncio to support nested event loops
-            # This is critical for functions that internally use asyncio 
-            # (like clients that provide a sync interface over async functions)
-            nest_asyncio.apply(thread_loop)
 
             # Set custom error handler to catch empty deque errors
             def custom_exception_handler(loop, context) -> None:  # noqa: ANN001, ARG001
