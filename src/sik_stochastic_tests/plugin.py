@@ -86,9 +86,8 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
     Modify collected test items to handle async stochastic tests.
 
     This hook intercepts async test functions marked with @stochastic and
-    wraps them with our stochastic execution logic. We now use the same
-    thread-based approach for both sync and async tests, but the preparation
-    is different because async tests need special handling with pytest-asyncio.
+    wraps them with our concurrent execution logic. We use trylast to ensure
+    we run after other hooks that might modify the test collection.
 
     Args:
         session: The pytest session
@@ -106,7 +105,7 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 item.get_closest_marker('stochastic') and
                 hasattr(item, 'obj')):
 
-            # We only need to pre-process async tests because they need special execution within the event loop  # noqa: E501
+            # We handle async tests differently because they need special execution within the event loop  # noqa: E501
             if has_asyncio_marker(item):
                 # Get stochastic parameters from the marker - use sensible defaults if not specified  # noqa: E501
                 marker = item.get_closest_marker("stochastic")
@@ -134,10 +133,33 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 # 1. Preserve the EXACT parameter signature of the original test function
                 # 2. Forward parameters to the original function with the exact same structure
                 # 3. Handle special cases like *args and **kwargs correctly
+                #
+                # If we don't do this, we get errors like:
+                # "TypeError: missing required positional argument 'kwargs'"
+                # This happens because pytest-asyncio sees 'kwargs' as a positional parameter
+                # instead of a variable keyword parameter (**kwargs) if we don't preserve the signature.  # noqa: E501
+                #
+                # WHY DYNAMIC CODE GENERATION:
+                # We use dynamic code generation (exec) for several critical reasons:
+                #   1. To create a wrapper with the EXACT same parameter signature as the original function  # noqa: E501
+                #   2. To support arbitrary parameter structures including *args and **kwargs
+                #   3. To satisfy pytest-asyncio's expectations for function signatures
+                #   4. To handle fixtures correctly, which requires specific parameter names
+                #
+                # Alternative approaches like using a generic **kwargs parameter would break
+                # pytest's fixture injection mechanism and create subtle parameter binding issues.
+                # While dynamic code generation adds complexity, it's the most robust way to
+                # handle the variety of function signatures we might encounter.
                 sig = inspect.signature(original_func)
 
                 # Create a parameter string that exactly matches the original function's signature.
                 # This is CRITICAL for proper fixture injection and interaction with pytest-asyncio.  # noqa: E501
+                # We must handle each parameter kind differently:
+                # - POSITIONAL_ONLY: rare in Python but needs special handling
+                # - POSITIONAL_OR_KEYWORD: regular parameters like "request" or "fixture_name"
+                # - KEYWORD_ONLY: parameters that can only be passed by keyword (after *)
+                # - VAR_POSITIONAL: *args parameters that collect extra positional arguments
+                # - VAR_KEYWORD: **kwargs parameters that collect extra keyword arguments
                 param_list = []
                 for name, param in sig.parameters.items():
                     if param.kind == inspect.Parameter.POSITIONAL_ONLY:  # noqa: SIM114
@@ -156,15 +178,17 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                 # When we call the original function from inside our wrapper, we need to
                 # forward all parameters exactly as they were received. This is especially
                 # important for *args and **kwargs parameters.
+                #
+                # We can't use a simple **locals() approach because that would include
+                # other local variables besides the function parameters.
                 param_forwarding = []
                 for name, param in sig.parameters.items():
                     if param.kind == inspect.Parameter.VAR_POSITIONAL:
                         # For *args parameters, we need to unpack them with *
                         param_forwarding.append(f"*{name}")
                     elif param.kind == inspect.Parameter.VAR_KEYWORD:
-                        # For **kwargs parameters, we need a special handling to avoid duplicates
-                        # This ensures we don't get "got multiple values for keyword argument" errors  # noqa: E501
-                        param_forwarding.append(f"**{{k: v for k, v in {name}.items() if k not in funcargs}}")  # noqa: E501
+                        # For **kwargs parameters, we need to unpack them with **
+                        param_forwarding.append(f"**{name}")
                     else:
                         # For all other parameters, we pass them as keyword arguments
                         # to ensure they're correctly passed regardless of order
@@ -174,6 +198,9 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
 
                 # The exec_context provides all the variables that will be accessible
                 # inside our dynamically created wrapper function.
+                #
+                # IMPORTANT: The module-level _test_results dictionary must be included
+                # for the wrapper to store test results that will be reported at the end.
                 exec_context = {'pytest': pytest,
                                'original_func': original_func,
                                'samples': samples,
@@ -187,108 +214,144 @@ def pytest_collection_modifyitems(session, config, items) -> None:  # noqa
                                'TimeoutError': TimeoutError,
                                'Exception': Exception,
                                '_test_results': _test_results,
-                               'item_nodeid': item.nodeid,
-                               '_run_stochastic_tests': _run_stochastic_tests,
-                               '_run_stochastic_tests_in_thread': _run_stochastic_tests_in_thread,
-                               'ValueError': ValueError,  # Common exception types for retry_on
-                               'TypeError': TypeError,
-                               'AssertionError': AssertionError}
+                               'item_nodeid': item.nodeid}
 
-                # Define a more robust wrapper function with a single string
-                # to avoid indentation issues in the dynamically generated code
+                # Define the wrapper function with our dynamically created parameter signature.
+                # We use exec() to create a function with the exact parameter structure we need.
+                #
+                # IMPORTANT: This dynamic code generation approach is a deliberate design choice.
+                # We're generating a string containing Python code that defines a function with
+                # the exact parameter signature we need, then executing that code with exec().
+                # This gives us maximum flexibility to handle any parameter structure.
+                #
+                # The @pytest.mark.asyncio decorator is critical - it signals to pytest-asyncio
+                # that this is an async function that needs special handling. Without this marker,
+                # pytest-asyncio would not know to handle this as an async test.
                 wrapper_code = f"""
 @pytest.mark.asyncio
 async def stochastic_async_wrapper({param_str}):
-    # Create a dictionary of function arguments
-    funcargs = {{}}
-"""
-
-                # Add parameter collection code with careful indentation
-                for name, param in sig.parameters.items():
-                    if param.kind == inspect.Parameter.VAR_POSITIONAL:
-                        # We skip *args parameters as they'll be passed directly
-                        pass
-                    elif param.kind == inspect.Parameter.VAR_KEYWORD:
-                        # For **kwargs, we update the funcargs dictionary
-                        wrapper_code += f"    funcargs.update({name})\n"
-                    else:
-                        # For normal parameters, add them to funcargs
-                        wrapper_code += f"    funcargs['{name}'] = {name}\n"
-
-                # Add the rest of the function implementation
-                wrapper_code += f"""
-    # Initialize statistics tracker for this test
+    # Create stats tracker for this test run
+    # This tracker will record successful/failed runs and provide aggregate statistics
     stats = StochasticTestStats()
 
-    # Create a specialized proxy function that handles different parameter kinds correctly
-    async def proxy_func(**kwargs):
-        # We need to reconstruct the function arguments based on the original signature
-        # The key is to make sure we're handling the params consistently
-        return await original_func({param_passing})
+    # Validate inputs to prevent common issues
+    if samples <= 0:
+        raise ValueError("samples must be a positive integer")
 
-    # Use the thread-based approach for consistent execution
-    import threading
-    import queue
-
-    # Use a queue to get results from the thread
-    result_queue = queue.Queue()
-
-    def thread_worker():
-        try:
-            # Create a new event loop for this thread
-            thread_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(thread_loop)
-
-            # Add custom exception handler for empty deque errors
-            def custom_exception_handler(loop, context):
-                exc = context.get('exception')
-                if isinstance(exc, IndexError) and str(exc) == "pop from an empty deque":
-                    return
-                thread_loop.default_exception_handler(context)
-
-            thread_loop.set_exception_handler(custom_exception_handler)
-
+    # Helper function to run a single test sample with retry logic
+    # This encapsulates the retry mechanism for each individual run of the test
+    async def run_single_test(i: int):
+        for attempt in range(max_retries):
             try:
-                # Run stochastic tests in this thread's event loop
-                thread_loop.run_until_complete(
-                    _run_stochastic_tests(
-                        testfunction=proxy_func,
-                        funcargs=funcargs,
-                        stats=stats,
-                        samples={samples},
-                        batch_size={batch_size},
-                        retry_on=retry_on,  # Pass the retry_on value directly without string formatting
-                        max_retries={max_retries},
-                        timeout={timeout},
-                    )
-                )
-                result_queue.put(("success", None))
+                # Apply timeout if specified to prevent tests from hanging
+                if timeout is not None:
+                    try:
+                        # IMPORTANT: We pass parameters EXACTLY as they were received
+                        # This is vital for proper handling of fixtures and special parameter types
+                        test_coro = original_func({param_passing})
+
+                        # asyncio.wait_for cancels the task if it exceeds the timeout
+                        await asyncio.wait_for(test_coro, timeout)
+                    except TimeoutError:
+                        raise TimeoutError(f"Test timed out after {{timeout}} seconds")
+                else:
+                    # No timeout specified - run with the exact parameters we received
+                    # The {param_passing} code preserves the exact parameter structure
+                    await original_func({param_passing})
+
+                # If we get here without an exception, the test passed
+                return True
             except Exception as e:
-                result_queue.put(("error", e))
-            finally:
-                thread_loop.close()
-                asyncio.set_event_loop(None)
-        except Exception as e:
-            result_queue.put(("error", e))
+                # If this exception type is in retry_on, we'll retry the test
+                if retry_on and isinstance(e, tuple(retry_on)) and attempt < max_retries - 1:
+                    # Continue to the next retry attempt
+                    continue
 
-    # Run the tests in a dedicated thread
-    worker_thread = threading.Thread(target=thread_worker, daemon=True)
-    worker_thread.start()
-    worker_thread.join()
+                # If we're not retrying, record detailed failure information
+                # This helps with debugging flaky tests by capturing context
+                failure_info = {{
+                    "error": str(e),
+                    "type": type(e).__name__,
+                    "context": {{"run_index": i}},
+                }}
+                return False, failure_info
 
-    # Get results from the thread
-    if not result_queue.empty():
-        status, exception = result_queue.get()
-        if status == "error" and exception is not None:
-            raise exception
+        # This executes if all retry attempts were exhausted
+        return False, {{
+            "error": f"Test failed after {{max_retries}} attempts",
+            "type": "RetryError",
+            "context": {{"run_index": i}},
+        }}
+
+    # Create a list of tasks to run the test multiple times
+    # Each task represents one execution of the test function
+    tasks = [run_single_test(i) for i in range(samples)]
+
+    # Handle batch execution to control concurrency
+    # This is important for resource-intensive tests where running
+    # too many instances simultaneously could cause system issues
+    effective_batch_size = None
+    if batch_size and batch_size > 0:
+        effective_batch_size = batch_size
+
+    # Run tests with batching if specified, otherwise all at once
+    if effective_batch_size:
+        # Run in batches to limit concurrency - this helps prevent resource
+        # exhaustion for tests that use significant resources (network, CPU, etc.)
+        for i in range(0, len(tasks), effective_batch_size):
+            batch = tasks[i:i + effective_batch_size]
+
+            # asyncio.gather runs all tasks concurrently and waits for all to complete
+            # return_exceptions=True ensures we get results even if some tasks fail
+            batch_results = await asyncio.gather(*batch, return_exceptions=True)
+
+            # Process results from this batch
+            for result in batch_results:
+                stats.total_runs += 1
+                if isinstance(result, Exception):
+                    # Handle unexpected exceptions (not from the test itself but from our wrapper)
+                    stats.failures.append({{
+                        "error": str(result),
+                        "type": type(result).__name__,
+                        "context": {{"unexpected_error": True}},
+                    }})
+                elif result is True:
+                    # Test passed
+                    stats.successful_runs += 1
+                else:
+                    # Test failed with details (the second item in the tuple is the failure info)
+                    stats.failures.append(result[1])
+    else:
+        # Run all tests at once when batching is not specified
+        # This is the most efficient for quick tests but can be resource-intensive
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process all results together
+        for result in all_results:
+            stats.total_runs += 1
+            if isinstance(result, Exception):
+                # Handle unexpected exceptions
+                stats.failures.append({{
+                    "error": str(result),
+                    "type": type(result).__name__,
+                    "context": {{"unexpected_error": True}},
+                }})
+            elif result is True:
+                # Test passed
+                stats.successful_runs += 1
+            else:
+                # Test failed with details
+                stats.failures.append(result[1])
 
     # Store test results in the global dictionary for reporting at the end of the session
+    # This is critical for the pytest_terminal_summary hook to show the stochastic test results
     _test_results[item_nodeid] = stats
 
-    # Enforce the success threshold
-    if stats.success_rate < {threshold}:
+    # Enforce the success threshold - if too many test runs failed, fail the overall test
+    # The threshold is a float between 0.0 and 1.0 representing the required success rate
+    if stats.success_rate < threshold:
         message = (
-            f"Stochastic test failed: success rate {{stats.success_rate:.2f}} below threshold {threshold}\\n"
+            f"Stochastic test failed: success rate {{stats.success_rate:.2f}} below threshold {{threshold}}\\n"
             f"Ran {{stats.total_runs}} times, {{stats.successful_runs}} successes, {{len(stats.failures)}} failures\\n"
             f"Failure details: {{stats.failures[:5]}}" +
             ("..." if len(stats.failures) > 5 else "")
@@ -296,20 +359,28 @@ async def stochastic_async_wrapper({param_str}):
         raise AssertionError(message)
 """  # noqa: E501
                 # Execute our dynamically created wrapper function code in a controlled namespace
+                # This creates the actual function object with the exact signature we need
                 local_ns = {}
                 exec(wrapper_code, exec_context, local_ns)
                 stochastic_async_wrapper = local_ns['stochastic_async_wrapper']
 
                 # Copy metadata from original function to wrapper
+                # This is CRITICAL for pytest to correctly identify and report the test.
+                # Without these attributes, pytest wouldn't display the correct test name
+                # in reports and the test hierarchy would be broken.
                 stochastic_async_wrapper.__name__ = original_func.__name__
                 stochastic_async_wrapper.__module__ = original_func.__module__
                 if hasattr(original_func, '__qualname__'):
                     stochastic_async_wrapper.__qualname__ = original_func.__qualname__
 
                 # The signature is vitally important for fixture resolution
+                # pytest-asyncio uses this to determine which fixtures to inject
+                # Without this, fixtures would not be correctly passed to our wrapper
                 stochastic_async_wrapper.__signature__ = sig
 
                 # Replace the original test function with our wrapper
+                # This causes pytest to run our wrapper instead of the original function
+                # when it executes this test item
                 item.obj = stochastic_async_wrapper
 
 def has_asyncio_marker(obj: pytest.Function | object) -> bool:
@@ -404,27 +475,8 @@ def _run_stochastic_tests_in_thread(
     """
     Run stochastic tests in a dedicated thread with its own event loop.
 
-    RACE CONDITION EXPLANATION:
-    We encountered a race condition in asyncio where multiple async generators
-    being cleaned up simultaneously across different contexts would sometimes
-    cause the event loop's _ready deque to become empty unexpectedly, resulting
-    in an "IndexError: pop from an empty deque" error. This occurred primarily
-    with async tests that use external libraries like OpenAI, httpx, or httpcore,
-    which rely heavily on async generators for streaming responses.
-
-    WHY THREAD ISOLATION HELPS:
-    In Python, each thread can have its own event loop. By running each stochastic
-    test session in a dedicated thread with its own isolated event loop, we prevent
-    interference between pytest-asyncio's event loop management and our concurrent
-    test executions. This isolation eliminates the race condition by ensuring that
-    async generator cleanup operations don't interfere with each other across
-    different execution contexts.
-
-    IMPLEMENTATION DETAILS:
-    1. We create a dedicated thread for running the test samples
-    2. This thread gets its own event loop with a custom exception handler
-    3. Test results are safely passed back to the main thread through a queue
-    4. The thread's event loop is properly closed and dereferenced when done
+    This prevents interference with pytest-asyncio's event loop, fixing issues
+    with 'pop from an empty deque' errors and event loop cleanup.
 
     Args:
         testfunction: The test function to execute
@@ -443,22 +495,7 @@ def _run_stochastic_tests_in_thread(
     result_queue = queue.Queue()
 
     def thread_worker() -> None:
-        """
-        Run all stochastic test samples in an isolated thread with its own event loop.
-
-        This function is the core of our thread isolation strategy:
-
-        1. It creates a new, isolated event loop for this thread only
-        2. Sets up a custom exception handler that specifically ignores the
-           "pop from an empty deque" IndexError that can occur during async cleanup
-        3. Runs all test samples in this isolated environment
-        4. Properly cleans up the event loop to prevent resource leaks
-        5. Returns results safely to the main thread via a queue
-
-        This approach resolves the race condition that occurs when async generators
-        from packages like httpx/httpcore (used by OpenAI, Anthropic clients) are
-        being cleaned up concurrently in the same event loop.
-        """
+        """Run all stochastic test samples in an isolated thread with its own event loop."""
         try:
             # Create a new event loop specific to this thread
             thread_loop = asyncio.new_event_loop()
@@ -475,6 +512,10 @@ def _run_stochastic_tests_in_thread(
 
             thread_loop.set_exception_handler(custom_exception_handler)
 
+            # Create a dummy task to ensure the loop queue is never empty
+            async def dummy() -> None:
+                await asyncio.sleep(0)
+            thread_loop.create_task(dummy())  # noqa: RUF006
 
             try:
                 # Run all test samples in this thread's event loop
@@ -568,15 +609,6 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
 
     # Run stochastic tests in a separate thread with its own event loop
     # This isolates our tests from pytest-asyncio's event loop, fixing the "pop from empty deque" error  # noqa: E501
-    #
-    # IMPORTANT: This thread-based approach is critical for preventing race conditions
-    # during async generator cleanup. By isolating each stochastic test run in its own
-    # thread with a dedicated event loop, we prevent interference with pytest-asyncio's
-    # event loop and avoid the "pop from empty deque" error that can occur when multiple
-    # async generators are being cleaned up simultaneously in shared execution contexts.
-    #
-    # This is particularly important for tests that use the OpenAI API, httpx, or other
-    # libraries that rely heavily on async generators for streaming responses.
     _run_stochastic_tests_in_thread(
         testfunction=testfunction,
         funcargs=funcargs,

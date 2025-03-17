@@ -14,7 +14,6 @@ import subprocess
 from unittest.mock import MagicMock
 from sik_stochastic_tests.plugin import (
     _run_stochastic_tests,
-    _run_stochastic_tests_in_thread,
     _test_results,
     StochasticTestStats,
     pytest_collection_modifyitems,
@@ -507,7 +506,7 @@ def test_async_batch_processing():
     """
     Test batching mechanism in the async-specific test runner.
 
-    This test verifies that the specialized _run_stochastic_tests_in_thread function:
+    This test verifies that the specialized _run_stochastic_tests function:
     - Properly implements concurrent execution with batching
     - Respects batch size limits when specified
     - Runs with higher concurrency when no batching is used
@@ -517,7 +516,7 @@ def test_async_batch_processing():
     to avoid creating unnecessary event loops.
     """
     import asyncio
-    from sik_stochastic_tests.plugin import _run_stochastic_tests_in_thread
+    from sik_stochastic_tests.plugin import _run_stochastic_tests
 
     class AsyncTestTracker:
         def __init__(self):
@@ -545,16 +544,22 @@ def test_async_batch_processing():
     tracker = AsyncTestTracker()
     stats = StochasticTestStats()
 
-    _run_stochastic_tests_in_thread(
-        testfunction=tracker.test_func,
-        funcargs={},
-        stats=stats,
-        samples=6,
-        batch_size=2,  # Limit to 2 concurrent executions
-        retry_on=None,
-        max_retries=1,
-        timeout=None,
-    )
+    # Create a new event loop for testing
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_run_stochastic_tests(
+            testfunction=tracker.test_func,
+            funcargs={},
+            stats=stats,
+            samples=6,
+            batch_size=2,  # Limit to 2 concurrent executions
+            retry_on=None,
+            max_retries=1,
+            timeout=None,
+        ))
+    finally:
+        loop.close()
 
     # Verify correct execution and stats
     assert stats.total_runs == 6
@@ -568,16 +573,22 @@ def test_async_batch_processing():
     tracker2 = AsyncTestTracker()
     stats2 = StochasticTestStats()
 
-    _run_stochastic_tests_in_thread(
-        testfunction=tracker2.test_func,
-        funcargs={},
-        stats=stats2,
-        samples=6,
-        batch_size=None,  # Unlimited concurrency
-        retry_on=None,
-        max_retries=1,
-        timeout=None,
-    )
+    # Create a new event loop for testing
+    loop2 = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop2)
+    try:
+        loop2.run_until_complete(_run_stochastic_tests(
+            testfunction=tracker2.test_func,
+            funcargs={},
+            stats=stats2,
+            samples=6,
+            batch_size=None,  # Unlimited concurrency
+            retry_on=None,
+            max_retries=1,
+            timeout=None,
+        ))
+    finally:
+        loop2.close()
 
     # Verify execution completed correctly
     assert stats2.total_runs == 6
@@ -662,30 +673,8 @@ async def test_edge_cases_parameter_validation():
     assert stats.total_runs == 1
     assert stats.successful_runs == 1
 
-    # Test the same validations for _run_stochastic_tests_in_thread
-    with pytest.raises(ValueError, match="samples must be a positive integer"):
-        _run_stochastic_tests_in_thread(
-            testfunction=test_func,
-            funcargs={},
-            stats=stats,
-            samples=-1,
-            batch_size=None,
-            retry_on=None,
-            max_retries=1,
-            timeout=None,
-        )
-
-    with pytest.raises(ValueError, match="retry_on must contain only exception types"):
-        _run_stochastic_tests_in_thread(
-            testfunction=test_func,
-            funcargs={},
-            stats=stats,
-            samples=1,
-            batch_size=None,
-            retry_on=["not_an_exception"],
-            max_retries=1,
-            timeout=None,
-        )
+    # Removed redundant test cases that repeat the already tested validations
+    # These were not working because they weren't awaited properly
 
 def test_async_wrapper_parallel_execution():
     """Test that the async wrapper executes tests in parallel with appropriate batching."""
@@ -806,16 +795,22 @@ def test_retry_exhaustion():
     stats = StochasticTestStats()
 
     # Run with retries, but it will still fail after max_retries
-    _run_stochastic_tests_in_thread(
-        testfunction=tracker.always_fail,
-        funcargs={},
-        stats=stats,
-        samples=1,
-        batch_size=None,
-        retry_on=[ValueError],  # Make ValueError retriable
-        max_retries=3,  # Allow 3 attempts
-        timeout=None,
-    )
+    # Create a new event loop for testing
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_run_stochastic_tests(
+            testfunction=tracker.always_fail,
+            funcargs={},
+            stats=stats,
+            samples=1,
+            batch_size=None,
+            retry_on=[ValueError],  # Make ValueError retriable
+            max_retries=3,  # Allow 3 attempts
+            timeout=None,
+        ))
+    finally:
+        loop.close()
 
     # Check attempts
     assert tracker.attempts == 3, "Should have attempted the test exactly 3 times"
@@ -2100,3 +2095,78 @@ async def test_multiple_async_clients():
     # Verify that there's no "pop from an empty deque" error
     assert "pop from an empty deque" not in result.stderr, "Error still present despite the fix"
     assert "Event loop is closed" not in result.stderr, "Event loop closed error still present"
+
+def test_sync_with_internal_async(example_test_dir: Path):
+    """Test stochastic tests with all combinations of sync/async."""
+    counter_file = example_test_dir / "counter.txt"
+    counter_file.write_text("0")
+    test_file = example_test_dir / "test_combined.py"
+    test_file.write_text("""
+import pytest
+import asyncio
+
+def increment_counter():
+    with open("counter.txt", "r") as f:
+        count = int(f.read())
+    with open("counter.txt", "w") as f:
+        f.write(str(count + 1))
+    return count + 1
+
+# Pure sync function
+@pytest.mark.stochastic(samples=2)
+def test_pure_sync():
+    count = increment_counter()
+    print(f"Pure sync test {count}")
+    assert True
+
+# Pure async function
+@pytest.mark.stochastic(samples=2)
+@pytest.mark.asyncio
+async def test_pure_async():
+    count = increment_counter()
+    print(f"Pure async test {count}")
+    await asyncio.sleep(0.01)
+    assert True
+
+# Sync function that uses async
+@pytest.mark.stochastic(samples=2)
+def test_sync_with_async():
+    async def inner():
+        await asyncio.sleep(0.01)
+        return True
+        
+    count = increment_counter()
+    print(f"Sync with async test {count}")
+    return inner()
+
+# Async test that calls sync function that uses async
+@pytest.mark.stochastic(samples=2)
+@pytest.mark.asyncio
+async def test_async_calling_sync_with_async():
+    def sync_func():
+        async def inner():
+            await asyncio.sleep(0.01)
+            return True
+        return inner()
+
+    count = increment_counter()
+    print(f"Async calling sync with async test {count}")
+    result = sync_func()
+    assert await result is True
+""")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(test_file), "-v"],
+        capture_output=True,
+        text=True,
+        cwd=example_test_dir,
+        check=False,
+    )
+    print(f"STDOUT: {result.stdout}")
+    print(f"STDERR: {result.stderr}")
+    assert "4 passed" in result.stdout, \
+        f"Expected all four tests to pass, got: {result.stdout}"
+    with open(counter_file) as f:
+        count = int(f.read())
+    # Each test runs twice, so 8 total runs
+    assert count == 8, \
+        f"Expected 8 total runs (4 tests x 2 samples), but got {count}"
