@@ -119,7 +119,7 @@ wheels = [
 
 [[package]]
 name = "sik-stochastic-tests"
-version = "0.0.29"
+version = "0.0.30"
 source = { editable = "." }
 dependencies = [
     { name = "nest-asyncio" },

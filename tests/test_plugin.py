@@ -2134,7 +2134,7 @@ def test_sync_with_async():
     async def inner():
         await asyncio.sleep(0.01)
         return True
-        
+
     count = increment_counter()
     print(f"Sync with async test {count}")
     return inner()

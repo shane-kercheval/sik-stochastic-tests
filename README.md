@@ -309,6 +309,40 @@ Timeouts for async tests are implemented using `asyncio.wait_for()`. If your tim
 1. Ensure you're using a recent version of this plugin
 2. Make sure your test is actually running asynchronously
 
+### Known Limitations
+
+#### Synchronous Code Using Async Internally
+
+When testing synchronous code that internally manages its own asyncio event loops (like libraries with synchronous API wrappers over async implementations), you may encounter event loop conflicts with the stochastic plugin:
+
+```python
+# This kind of code may cause issues with the stochastic plugin
+@pytest.mark.stochastic(samples=3)
+def test_problematic():
+    # This function looks synchronous but internally creates/manages its own event loop
+    result = client(messages=[{"role": "user", "content": "test"}])
+    assert result is not None
+```
+
+**Error symptoms:**
+- `IndexError: pop from an empty deque` 
+- `RuntimeError: Event loop is closed`
+
+These errors occur because of conflicts between the event loop management in the stochastic plugin and the event loop created by the synchronous wrapper.
+
+**Workaround:**
+Use the async interface directly whenever possible:
+```python
+@pytest.mark.asyncio
+@pytest.mark.stochastic(samples=3)
+async def test_better():
+    # Using the async API directly avoids the event loop conflict
+    result = await client.run_async(messages=[{"role": "user", "content": "test"}])
+    assert result is not None
+```
+
+This approach avoids the conflict by using a single event loop managed by pytest-asyncio.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
