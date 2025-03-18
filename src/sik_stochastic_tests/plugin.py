@@ -525,7 +525,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
                 retry_on=retry_on,
                 max_retries=max_retries,
                 timeout=timeout,
-            )
+            ),
         )
     finally:
         loop.close()
