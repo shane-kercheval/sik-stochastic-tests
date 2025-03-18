@@ -461,101 +461,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Disable stochastic mode for tests marked with @stochastic",
     )
 
-# Helper function to run stochastic tests in a separate thread
-def _run_stochastic_tests_in_thread(
-    testfunction: callable,
-    funcargs: dict[str, object],
-    stats: StochasticTestStats,
-    samples: int,
-    batch_size: int | None,
-    retry_on: tuple[Exception] | list[type[Exception]] | None,
-    max_retries: int = 3,
-    timeout: int | None = None,
-) -> None:
-    """
-    Run stochastic tests in a dedicated thread with its own event loop.
-
-    This prevents interference with pytest-asyncio's event loop, fixing issues
-    with 'pop from an empty deque' errors and event loop cleanup.
-
-    Args:
-        testfunction: The test function to execute
-        funcargs: Arguments to pass to the test function
-        stats: Statistics object to track test results
-        samples: Number of times to run the test
-        batch_size: Number of tests to run concurrently
-        retry_on: Exception types that should trigger a retry
-        max_retries: Maximum retry attempts per test
-        timeout: Maximum time in seconds per test execution
-    """
-    import threading
-    import queue
-
-    # Use a queue to get results back from the thread
-    result_queue = queue.Queue()
-
-    def thread_worker() -> None:
-        """Run all stochastic test samples in an isolated thread with its own event loop."""
-        try:
-            # Create a new event loop specific to this thread
-            thread_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(thread_loop)
-
-            # Set custom error handler to catch empty deque errors
-            def custom_exception_handler(loop, context) -> None:  # noqa: ANN001, ARG001
-                exc = context.get('exception')
-                if isinstance(exc, IndexError) and str(exc) == "pop from an empty deque":
-                    # Silently ignore this specific error
-                    return
-                # Use default handler for all other errors
-                thread_loop.default_exception_handler(context)
-
-            thread_loop.set_exception_handler(custom_exception_handler)
-
-            # Create a dummy task to ensure the loop queue is never empty
-            async def dummy() -> None:
-                await asyncio.sleep(0)
-            thread_loop.create_task(dummy())  # noqa: RUF006
-
-            try:
-                # Run all test samples in this thread's event loop
-                thread_loop.run_until_complete(
-                    _run_stochastic_tests(
-                        testfunction=testfunction,
-                        funcargs=funcargs,
-                        stats=stats,
-                        samples=samples,
-                        batch_size=batch_size,
-                        retry_on=retry_on,
-                        max_retries=max_retries,
-                        timeout=timeout,
-                    ),
-                )
-                result_queue.put(("success", None))
-            except Exception as e:
-                # Pass any exceptions back to the main thread
-                result_queue.put(("error", e))
-            finally:
-                # Always clean up the loop
-                thread_loop.close()
-                # Reset this thread's event loop
-                asyncio.set_event_loop(None)
-        except Exception as e:
-            # Catch any unexpected errors in thread setup
-            result_queue.put(("error", e))
-
-    # Create and start the worker thread
-    worker_thread = threading.Thread(target=thread_worker, daemon=True)
-    worker_thread.start()
-    worker_thread.join()  # Wait for thread to complete
-
-    # Get results from the thread
-    if not result_queue.empty():
-        status, exception = result_queue.get()
-        if status == "error" and exception is not None:
-            # Re-raise any exceptions that occurred in the thread
-            raise exception
-
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     """
@@ -607,18 +512,24 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
     actual_argnames = set(sig.parameters.keys())
     funcargs = {name: arg for name, arg in pyfuncitem.funcargs.items() if name in actual_argnames}
 
-    # Run stochastic tests in a separate thread with its own event loop
-    # This isolates our tests from pytest-asyncio's event loop, fixing the "pop from empty deque" error  # noqa: E501
-    _run_stochastic_tests_in_thread(
-        testfunction=testfunction,
-        funcargs=funcargs,
-        stats=stats,
-        samples=samples,
-        batch_size=batch_size,
-        retry_on=retry_on,
-        max_retries=max_retries,
-        timeout=timeout,
-    )
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(
+            _run_stochastic_tests(
+                testfunction=testfunction,
+                funcargs=funcargs,
+                stats=stats,
+                samples=samples,
+                batch_size=batch_size,
+                retry_on=retry_on,
+                max_retries=max_retries,
+                timeout=timeout,
+            )
+        )
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
 
     # Store test results for terminal reporting
     _test_results[pyfuncitem.nodeid] = stats
